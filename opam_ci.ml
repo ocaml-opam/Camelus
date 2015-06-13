@@ -14,7 +14,7 @@ module RepoGit = struct
   module GitStore = Git_unix.FS
   module GitSync = Git_unix.Sync.Make(GitStore)
 
-  let upstream = "AltGr/opam-repository"
+  let upstream = "ocaml/opam-repository"
 
   let github_repo slug =
     Git.Gri.of_string (Printf.sprintf "git://github.com/%s" slug)
@@ -28,18 +28,12 @@ module RepoGit = struct
     log "Reading %s\n" (Git.SHA.to_hex sha);
     GitStore.read t sha >>= function
     | Some (Git.Value.Commit c) ->
-      log "Found commit «%s»\n"
-        (List.hd (OpamStd.String.split c.Git.Commit.message '\n'));
       GitStore.read t (Git.SHA.of_tree c.Git.Commit.tree) >>= (function
           | Some (Git.Value.Tree t) -> return t
-          | _ ->
-            log "Tree fetch failed\n";
-            fail (Failure "invalid base tree"))
+          | _ -> fail (Failure "invalid base tree"))
     | None ->
-      log "Commit not found\n";
       fail (Failure "base is not a commit")
     | Some _ ->
-      log "Unexpected commit contents\n";
       fail (Failure "base is not a commit")
 
   let changed_files pull_request =
@@ -48,18 +42,9 @@ module RepoGit = struct
     log "fetched upstream\n";
     tree_of_sha t (Git.SHA.of_hex pull_request.base_sha) >>= fun base_tree ->
     log "got base tree\n";
-    GitSync.fetch t (github_repo pull_request.head_repo) >>= fun head_fetch ->
-    log "fetched user: %s\n" (Git.Sync.Result.pretty_fetch head_fetch);
-    (match
-       Git.Reference.head_contents head_fetch.Git.Sync.Result.references
-         (Git.SHA.Commit.of_hex pull_request.head_sha)
-     with
-     | Git.Reference.SHA c -> return c
-     | Git.Reference.Ref r ->
-       GitStore.read_reference_exn t r)
-    >>= fun head_commit ->
-    log "Found head commit: %s\n" (Git.SHA.Commit.to_hex head_commit);
-    tree_of_sha t (Git.SHA.of_commit head_commit) >>= fun head_tree ->
+    GitSync.fetch t (github_repo pull_request.head_repo) >>= fun _ ->
+    log "fetched user\n";
+    tree_of_sha t (Git.SHA.of_hex pull_request.head_sha) >>= fun head_tree ->
     log "got head tree\n";
     let module M = OpamStd.String.Map in
     let tree_to_map path t =
@@ -67,24 +52,19 @@ module RepoGit = struct
           M.add (path ^ "/" ^ e.Git.Tree.name) e.Git.Tree.node m)
         M.empty t
     in
-    let rec changed_new acc parentpath left_tree right_tree =
-      log "Diff at %s/\n" parentpath;
-      let left_map = tree_to_map parentpath left_tree in
-      let rec diff path right_tree acc = match right_tree with
-        | [] -> return acc
-        | { Git.Tree.name; node; _ } :: rest ->
-          let path = parentpath ^ "/" ^ name in
+    let rec changed_new acc path left_tree right_tree =
+      let left_map = tree_to_map path left_tree in
+      List.fold_left (fun acc { Git.Tree.name; node; _ } ->
+          let path = path ^ "/" ^ name in
           GitStore.read_exn t node >>= fun right ->
           (try GitStore.read t (M.find path left_map)
            with Not_found -> return None)
           >>= fun left_opt ->
-          (if left_opt = Some right then return acc
+          (if left_opt = Some right then acc
            else match right with
              | Git.Value.Blob b ->
-               log "%s: file changed\n" path;
-               return (M.add path (Git.Blob.to_raw b) acc)
+               acc >|= M.add path (Git.Blob.to_raw b)
              | Git.Value.Tree right_subtree ->
-               log "%s: subtree changed\n" path;
                let left_subtree =
                  match left_opt with
                  | Some (Git.Value.Tree t) -> t
@@ -92,13 +72,11 @@ module RepoGit = struct
                in
                changed_new acc path left_subtree right_subtree
              | Git.Value.Tag _ | Git.Value.Commit _ ->
-               fail (Failure "Corrupted git state"))
-          >>= diff parentpath rest
-      in
-      diff parentpath right_tree acc
+               fail (Failure "Corrupted git state")))
+        acc right_tree
     in
-    changed_new M.empty "" base_tree head_tree >>= fun diff ->
-    return (M.keys diff)
+    changed_new (return M.empty) "" base_tree head_tree >>= fun diff ->
+    return (M.bindings diff)
 
 end
 
@@ -107,9 +85,104 @@ let check_pull_request pr =
   log "PR received: #%d (%s from %s/%s over %s)\n"
     pr.number pr.head_sha pr.head_repo pr.head_ref pr.base_sha;
   RepoGit.changed_files pr >|= fun files ->
-  log "Checking pr #%d: base %s, head %s#%s (%s):\n  Changed files = %s\n"
-    pr.number pr.base_sha pr.head_repo pr.head_ref pr.head_sha
-    (String.concat ", " files)
+  let opam_files =
+    List.filter (fun (s,_) ->
+        OpamStd.String.starts_with ~prefix:"/packages/" s &&
+        OpamStd.String.ends_with ~suffix:"/opam" s)
+      files
+  in
+  let lint =
+    List.map (fun (file,contents) ->
+        let opam = OpamSystem.temp_file "opam" in
+        OpamSystem.write opam contents;
+        let r, opamopt =
+          OpamFile.OPAM.validate_file (OpamFilename.of_string opam)
+        in
+        OpamSystem.remove_file opam;
+        file, r, opamopt)
+      opam_files
+  in
+  let passed, failed =
+    List.partition (function _, [], Some _ -> true | _ -> false) lint
+  in
+  let errors, warnings =
+    List.partition (fun (_, we, _) ->
+        List.exists (function _, `Error, _ -> true | _ -> false) we)
+      failed
+  in
+  let title =
+    if errors <> [] then
+      "### :x: opam-lint errors\n\n"
+    else if warnings <> [] then
+      "### :exclamation: opam-lint warnings\n\n"
+    else
+      "### :white_check_mark: all lint checks passed\n\n"
+  in
+  let pkgname = function
+    | f,_,Some o ->
+      OpamPackage.(to_string
+                     (create OpamFile.OPAM.(name o) OpamFile.OPAM.(version o)))
+    | f,_,None ->
+      OpamStd.Option.Op.(
+        (OpamPackage.(of_dirname OpamFilename.(dirname (of_string f)))
+         >>| OpamPackage.to_string)
+        +! f)
+  in
+  let pass =
+    OpamStd.List.concat_map ", "
+      ~nil:""
+      ~left:"These packages passed lint tests: %s\n\n"
+       pkgname passed
+  in
+  let warns =
+    OpamStd.List.concat_map "\n\n"
+      (fun ((_, warns, _) as fe) ->
+         Printf.sprintf "#### **%s** has some warnings:\n\n%s\n"
+           (pkgname fe)
+           (OpamStd.Format.itemize ~bullet:"* "
+              (fun (num,_,msg) -> Printf.sprintf "**warning %d**: %s" num msg)
+              warns))
+      warnings
+  in
+  let errs =
+    OpamStd.List.concat_map "\n\n"
+      (fun ((_, we, _) as fe) ->
+         Printf.sprintf "#### **%s** has errors:\n\n%s\n"
+           (pkgname fe)
+           (OpamStd.Format.itemize ~bullet:"* "
+              (fun (num,kind,msg) ->
+                 let kind = match kind with
+                   | `Warning -> "warning"
+                   | `Error -> "error"
+                 in
+                 Printf.sprintf "**%s %d:** %s" kind num msg)
+              we))
+      errors
+  in
+  title ^ errs ^ warns ^ pass
+
+let github_api =
+  Uri.of_string "https://api.github.com"
+
+let push_report token pr report =
+  let open Lwt in
+  let uri =
+    Uri.with_path github_api
+      (Printf.sprintf "/repos/%s/issues/%d/comments"
+         RepoGit.upstream pr.number)
+  in
+  let json = OpamJson.to_string (`O ["body",`String report]) in
+  let body = Cohttp_lwt_body.of_string json in
+  let headers =
+    let t = Cohttp.Header.init () in
+    let t = Cohttp.Header.add_authorization t (`Basic ("opam-ci",token)) in
+    Cohttp.Header.prepend_user_agent t "Opam Continuous Integration Bot"
+  in
+  log "%s\n" report;
+  Cohttp_lwt_unix.Client.post ~body ~headers uri >>= fun (resp,body) ->
+  if Cohttp.Code.(is_success (code_of_status (Cohttp_lwt_unix.Client.Response.status resp)))
+  then return (log "Posted back to PR #%d.\n" pr.number)
+  else Cohttp_lwt_body.to_string body >|= log "Error posting back: %s"
 
 module Webhook_handler = struct
 
@@ -199,12 +272,16 @@ module Webhook_handler = struct
 end
 
 let () =
+  let token = Sys.argv.(1) in
   let open Lwt in
   let pr_stream, pr_push = Lwt_stream.create () in
   let rec check_loop () =
     (* The checks are done sequentially *)
     Lwt.try_bind
-      (fun () -> Lwt_stream.next pr_stream >>= check_pull_request)
+      (fun () ->
+         Lwt_stream.next pr_stream >>= fun pr ->
+         check_pull_request pr >>= fun report ->
+         push_report token pr report)
       (fun () -> return_unit)
       (fun exn -> log "Check failed: %s\n" (Printexc.to_string exn); return_unit)
     >>= check_loop
