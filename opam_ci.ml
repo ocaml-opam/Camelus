@@ -173,41 +173,44 @@ module PrLint = struct
                 we))
         errors
     in
-    title ^ errs ^ warns ^ pass
+    let status =
+      if errors <> [] then `Errors (List.map pkgname errors)
+      else if warnings <> [] then `Warnings (List.map pkgname warnings)
+      else `Passed
+    in
+    status, String.concat "" [title; errs; warns; pass]
+
 end
 
 module Github_comment = struct
 
-  let github_api =
-    Uri.of_string "https://api.github.com"
-
-  (* Not using ocaml-github at the moment since this is so simple. More complex
-     handling could be useful to e.g. update the comment rather than add a new
-     one every time though. Or use more advanced authentication. *)
-
-  let push_report ~name ~token ~report pr =
-    (* let open Github.Monad in *)
-    let open Lwt.Infix in
-    let uri =
-      Uri.with_path github_api
-        (Printf.sprintf "/repos/%s/issues/%d/comments"
-           RepoGit.upstream pr.number)
+  let push_report ~name ~token ~report:(status,msg) pr =
+    let open Github.Monad in
+    let status =
+      let new_status_state, new_status_description =
+        match status with
+        | `Passed ->
+          `Success, Some "All opam-lint tests passed"
+        | `Warnings ps ->
+          `Success, Some ("Packages with warnings: "^String.concat " " ps)
+        | `Errors ps ->
+          `Error, Some ("Packages with errors: "^String.concat " " ps)
+      in
+      { Github_t.
+        new_status_state;
+        new_status_target_url = None;
+        new_status_description;
+      }
     in
-    let json = OpamJson.to_string (`O ["body",`String report]) in
-    let body = Cohttp_lwt_body.of_string json in
-    let headers =
-      let t = Cohttp.Header.init () in
-      let t = Cohttp.Header.add_authorization t (`Basic (name,token)) in
-      Cohttp.Header.prepend_user_agent t "Opam Continuous Integration Bot"
-    in
-    log "%s" report;
-    Cohttp_lwt_unix.Client.post ~body ~headers uri >>= fun (resp,body) ->
-    if Cohttp.Code.(
-        is_success
-          (code_of_status (Cohttp.Response.status resp))
-      )
-    then Lwt.return (log "Posted back to PR #%d." pr.number)
-    else Cohttp_lwt_body.to_string body >|= log "Error posting back: %s"
+    run (
+      Github.Status.create
+        ~token ~user:name ~repo:RepoGit.upstream ~status ~sha:pr.head_sha ()
+      >>= fun _ ->
+      Github.Issue.create_comment
+        ~token ~user:name ~repo:RepoGit.upstream ~num:pr.number ~body:msg ()
+      >>= fun _ ->
+      return (log "Posted back to PR #%d." pr.number)
+    )
 
 end
 
@@ -314,13 +317,13 @@ module Conf = struct
   module C = struct
     let internal = ".opam-ci"
 
-    type t = { port: int; name: string; token: string; secret: string }
+    type t = { port: int; name: string; token: Github.Token.t; secret: Cstruct.t }
 
     let empty = {
       port = 8122;
       name = "opam-ci";
-      token = "";
-      secret = "";
+      token = Github.Token.of_string "";
+      secret = Cstruct.of_string "";
     }
 
     open OpamFormat
@@ -332,8 +335,8 @@ module Conf = struct
       {
         port = assoc_default 8122 f "port" parse_int;
         name = assoc_default "opam-ci" f "name" parse_string;
-        token = assoc f "token" parse_string;
-        secret = assoc f "secret" parse_string;
+        token = Github.Token.of_string (assoc f "token" parse_string);
+        secret = Cstruct.of_string (assoc f "secret" parse_string);
       }
 
     let to_string _ _ = assert false
@@ -372,6 +375,6 @@ let () =
       check_loop ();
       Webhook_handler.server
         ~port:conf.Conf.port
-        ~secret:(Cstruct.of_string conf.Conf.secret)
+        ~secret:conf.Conf.secret
         ~handler:(fun pr -> Lwt.return (pr_push (Some pr)));
     ])
