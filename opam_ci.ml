@@ -1,4 +1,4 @@
-let log fmt = OpamConsole.msg (fmt ^^ "%!")
+let log fmt = OpamConsole.msg (fmt ^^ "\n%!")
 
 type pull_request = {
   number: int;
@@ -25,27 +25,35 @@ module RepoGit = struct
   let local_mirror = "./opam-repository.git"
 
   let tree_of_sha t sha =
-    log "Reading %s\n" (Git.SHA.to_hex sha);
+    log "Reading %s" (Git.SHA.to_hex sha);
     GitStore.read t sha >>= function
     | Some (Git.Value.Commit c) ->
       GitStore.read t (Git.SHA.of_tree c.Git.Commit.tree) >>= (function
           | Some (Git.Value.Tree t) -> return t
           | _ -> fail (Failure "invalid base tree"))
     | None ->
-      fail (Failure "base is not a commit")
-    | Some _ ->
-      fail (Failure "base is not a commit")
+      fail (Failure "base commit not found")
+    | Some x ->
+      let kind = Git.Object_type.to_string (Git.Value.type_of x) in
+      fail (Failure (Printf.sprintf "base is not a commit (%s)" kind))
 
   let changed_files pull_request =
     GitStore.create ~root:local_mirror () >>= fun t ->
-    GitSync.fetch t upstream_repo >>= fun _ ->
-    log "fetched upstream\n";
+    (* Fetching upstream is actually unneeded (the remote repo should include
+       the commits) -- that is, until we check that the PR is really from a
+       parent of the origin's master or signed commit. *)
+    (* GitSync.fetch t upstream_repo >>= fun _ -> *)
+    (* log "fetched upstream\n"; *)
+    GitSync.fetch t (github_repo pull_request.head_repo) >>= fun head_fetch ->
+    log "fetched user repo";
+    (* let head_ref = *)
+    (*   Git.Reference.Map.find pull_request.head_ref head_fetch.Git.Sync.Result.references *)
+    (* in *)
+    (* GitStore.write_reference t  *)
     tree_of_sha t (Git.SHA.of_hex pull_request.base_sha) >>= fun base_tree ->
-    log "got base tree\n";
-    GitSync.fetch t (github_repo pull_request.head_repo) >>= fun _ ->
-    log "fetched user\n";
+    log "got base tree";
     tree_of_sha t (Git.SHA.of_hex pull_request.head_sha) >>= fun head_tree ->
-    log "got head tree\n";
+    log "got head tree";
     let module M = OpamStd.String.Map in
     let tree_to_map path t =
       List.fold_left (fun m e ->
@@ -80,109 +88,123 @@ module RepoGit = struct
 
 end
 
-let check_pull_request pr =
-  let open Lwt in
-  log "PR received: #%d (%s from %s/%s over %s)\n"
-    pr.number pr.head_sha pr.head_repo pr.head_ref pr.base_sha;
-  RepoGit.changed_files pr >|= fun files ->
-  let opam_files =
-    List.filter (fun (s,_) ->
-        OpamStd.String.starts_with ~prefix:"/packages/" s &&
-        OpamStd.String.ends_with ~suffix:"/opam" s)
-      files
-  in
-  let lint =
-    List.map (fun (file,contents) ->
-        let opam = OpamSystem.temp_file "opam" in
-        OpamSystem.write opam contents;
-        let r, opamopt =
-          OpamFile.OPAM.validate_file (OpamFilename.of_string opam)
-        in
-        OpamSystem.remove_file opam;
-        file, r, opamopt)
-      opam_files
-  in
-  let passed, failed =
-    List.partition (function _, [], Some _ -> true | _ -> false) lint
-  in
-  let errors, warnings =
-    List.partition (fun (_, we, _) ->
-        List.exists (function _, `Error, _ -> true | _ -> false) we)
-      failed
-  in
-  let title =
-    if errors <> [] then
-      "### :x: opam-lint errors\n\n"
-    else if warnings <> [] then
-      "### :exclamation: opam-lint warnings\n\n"
-    else
-      "### :white_check_mark: all lint checks passed\n\n"
-  in
-  let pkgname = function
-    | f,_,Some o ->
-      OpamPackage.(to_string
-                     (create OpamFile.OPAM.(name o) OpamFile.OPAM.(version o)))
-    | f,_,None ->
+module PrLint = struct
+
+  let check_pull_request pr =
+    let open Lwt in
+    log "PR received: #%d (%s from %s/%s over %s)"
+      pr.number pr.head_sha pr.head_repo pr.head_ref pr.base_sha;
+    RepoGit.changed_files pr >|= fun files ->
+    let opam_files =
+      List.filter (fun (s,_) ->
+          OpamStd.String.starts_with ~prefix:"/packages/" s &&
+          OpamStd.String.ends_with ~suffix:"/opam" s)
+        files
+    in
+    let lint =
+      List.map (fun (file,contents) ->
+          let r, opamopt =
+            OpamFile.OPAM.validate_string (OpamFilename.of_string file) contents
+          in
+          file, r, opamopt)
+        opam_files
+    in
+    let unwanted_warns = [21] in
+    let lint =
+      List.map (fun (f,r,o) ->
+          f, List.filter (fun (n,_,_) -> not (List.mem n unwanted_warns)) r, o)
+        lint
+    in
+    let passed, failed =
+      List.partition (function _, [], Some _ -> true | _ -> false) lint
+    in
+    let errors, warnings =
+      List.partition (fun (_, we, _) ->
+          List.exists (function _, `Error, _ -> true | _ -> false) we)
+        failed
+    in
+    let title =
+      if errors <> [] then
+        "### :x: opam-lint errors\n\n"
+      else if warnings <> [] then
+        "### :exclamation: opam-lint warnings\n\n"
+      else
+        "### :white_check_mark: all lint checks passed\n\n"
+    in
+    let pkgname (f,_,_) =
       OpamStd.Option.Op.(
-        (OpamPackage.(of_dirname OpamFilename.(dirname (of_string f)))
+        (OpamPackage.(of_filename OpamFilename.(of_string f))
          >>| OpamPackage.to_string)
         +! f)
-  in
-  let pass =
-    OpamStd.List.concat_map ", "
-      ~nil:""
-      ~left:"These packages passed lint tests: %s\n\n"
-       pkgname passed
-  in
-  let warns =
-    OpamStd.List.concat_map "\n\n"
-      (fun ((_, warns, _) as fe) ->
-         Printf.sprintf "#### **%s** has some warnings:\n\n%s\n"
-           (pkgname fe)
-           (OpamStd.Format.itemize ~bullet:"* "
-              (fun (num,_,msg) -> Printf.sprintf "**warning %d**: %s" num msg)
-              warns))
-      warnings
-  in
-  let errs =
-    OpamStd.List.concat_map "\n\n"
-      (fun ((_, we, _) as fe) ->
-         Printf.sprintf "#### **%s** has errors:\n\n%s\n"
-           (pkgname fe)
-           (OpamStd.Format.itemize ~bullet:"* "
-              (fun (num,kind,msg) ->
-                 let kind = match kind with
-                   | `Warning -> "warning"
-                   | `Error -> "error"
-                 in
-                 Printf.sprintf "**%s %d:** %s" kind num msg)
-              we))
-      errors
-  in
-  title ^ errs ^ warns ^ pass
+    in
+    let pass =
+      OpamStd.List.concat_map ", "
+        ~nil:""
+        ~left:"---\nThese packages passed lint tests: "
+        ~right:"\n"
+        pkgname passed
+    in
+    let warns =
+      OpamStd.List.concat_map "\n\n"
+        (fun ((_, warns, _) as fe) ->
+           Printf.sprintf "#### **%s** has some warnings:\n\n%s\n"
+             (pkgname fe)
+             (OpamStd.Format.itemize ~bullet:"* "
+                (fun (num,_,msg) -> Printf.sprintf "**warning %d**: %s" num msg)
+                warns))
+        warnings
+    in
+    let errs =
+      OpamStd.List.concat_map "\n\n"
+        (fun ((_, we, _) as fe) ->
+           Printf.sprintf "#### **%s** has errors:\n\n%s\n"
+             (pkgname fe)
+             (OpamStd.Format.itemize ~bullet:"* "
+                (fun (num,kind,msg) ->
+                   let kind = match kind with
+                     | `Warning -> "warning"
+                     | `Error -> "error"
+                   in
+                   Printf.sprintf "**%s %d:** %s" kind num msg)
+                we))
+        errors
+    in
+    title ^ errs ^ warns ^ pass
+end
 
-let github_api =
-  Uri.of_string "https://api.github.com"
+module Github_comment = struct
 
-let push_report token pr report =
-  let open Lwt in
-  let uri =
-    Uri.with_path github_api
-      (Printf.sprintf "/repos/%s/issues/%d/comments"
-         RepoGit.upstream pr.number)
-  in
-  let json = OpamJson.to_string (`O ["body",`String report]) in
-  let body = Cohttp_lwt_body.of_string json in
-  let headers =
-    let t = Cohttp.Header.init () in
-    let t = Cohttp.Header.add_authorization t (`Basic ("opam-ci",token)) in
-    Cohttp.Header.prepend_user_agent t "Opam Continuous Integration Bot"
-  in
-  log "%s\n" report;
-  Cohttp_lwt_unix.Client.post ~body ~headers uri >>= fun (resp,body) ->
-  if Cohttp.Code.(is_success (code_of_status (Cohttp_lwt_unix.Client.Response.status resp)))
-  then return (log "Posted back to PR #%d.\n" pr.number)
-  else Cohttp_lwt_body.to_string body >|= log "Error posting back: %s"
+  let github_api =
+    Uri.of_string "https://api.github.com"
+
+  (* Not using ocaml-github at the moment since this is so simple. More complex
+     handling could be useful to e.g. update the comment rather than add a new
+     one every time though. Or use more advanced authentication. *)
+
+  let push_report token pr report =
+    let open Lwt in
+    let uri =
+      Uri.with_path github_api
+        (Printf.sprintf "/repos/%s/issues/%d/comments"
+           RepoGit.upstream pr.number)
+    in
+    let json = OpamJson.to_string (`O ["body",`String report]) in
+    let body = Cohttp_lwt_body.of_string json in
+    let headers =
+      let t = Cohttp.Header.init () in
+      let t = Cohttp.Header.add_authorization t (`Basic ("opam-ci",token)) in
+      Cohttp.Header.prepend_user_agent t "Opam Continuous Integration Bot"
+    in
+    log "%s" report;
+    Cohttp_lwt_unix.Client.post ~body ~headers uri >>= fun (resp,body) ->
+    if Cohttp.Code.(
+        is_success
+          (code_of_status (Cohttp.Response.status resp))
+      )
+    then return (log "Posted back to PR #%d." pr.number)
+    else Cohttp_lwt_body.to_string body >|= log "Error posting back: %s"
+
+end
 
 module Webhook_handler = struct
 
@@ -219,14 +241,15 @@ module Webhook_handler = struct
            (OpamStd.Format.itemize (fun s -> s)
               (Uri.path (Request.uri req) ::
                Code.string_of_method (Request.meth req) ::
-               OpamStd.Option.to_string (fun x -> x) (Header.get_media_type (Request.headers req)) ::
+               OpamStd.Option.to_string (fun x -> x)
+                 (Header.get_media_type (Request.headers req)) ::
                OpamStd.List.filter_map (Header.get (Request.headers req))
                  ["user-agent"; "content-type"; "x-github-event"]));
          Server.respond_not_found ())
       else
       let (-.-) json key = match json with
         | `O dic -> List.assoc key dic
-        | _ -> log "field %s not found\n" key; raise Not_found
+        | _ -> log "field %s not found" key; raise Not_found
       in
       let to_string = function
         | `String s -> s
@@ -234,7 +257,7 @@ module Webhook_handler = struct
       in
       let to_int = function
         | `Float f -> int_of_float f
-        | _ -> log "bad float\n"; raise Not_found
+        | _ -> log "bad float"; raise Not_found
       in
       Cohttp_lwt_body.to_string body >>= fun body ->
       let act_pr =
@@ -267,7 +290,7 @@ module Webhook_handler = struct
       | None ->
         Server.respond_error ~body:"Bad request" ()
     in
-    log "Listening on port %d\n" port;
+    log "Listening on port %d" port;
     Server.create ~mode:(`TCP (`Port port)) (Server.make ~callback ())
 end
 
@@ -280,10 +303,10 @@ let () =
     Lwt.try_bind
       (fun () ->
          Lwt_stream.next pr_stream >>= fun pr ->
-         check_pull_request pr >>= fun report ->
-         push_report token pr report)
+         PrLint.check_pull_request pr >>= fun report ->
+         Github_comment.push_report token pr report)
       (fun () -> return_unit)
-      (fun exn -> log "Check failed: %s\n" (Printexc.to_string exn); return_unit)
+      (fun exn -> log "Check failed: %s" (Printexc.to_string exn); return_unit)
     >>= check_loop
   in
   Lwt_main.run (join [
