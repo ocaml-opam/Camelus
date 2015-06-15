@@ -10,7 +10,7 @@ type pull_request = {
 
 module RepoGit = struct
 
-  open Lwt
+  open Lwt.Infix
   module GitStore = Git_unix.FS
   module GitSync = Git_unix.Sync.Make(GitStore)
 
@@ -29,13 +29,13 @@ module RepoGit = struct
     GitStore.read t sha >>= function
     | Some (Git.Value.Commit c) ->
       GitStore.read t (Git.SHA.of_tree c.Git.Commit.tree) >>= (function
-          | Some (Git.Value.Tree t) -> return t
-          | _ -> fail (Failure "invalid base tree"))
+          | Some (Git.Value.Tree t) -> Lwt.return t
+          | _ -> Lwt.fail (Failure "invalid base tree"))
     | None ->
-      fail (Failure "base commit not found")
+      Lwt.fail (Failure "base commit not found")
     | Some x ->
       let kind = Git.Object_type.to_string (Git.Value.type_of x) in
-      fail (Failure (Printf.sprintf "base is not a commit (%s)" kind))
+      Lwt.fail (Failure (Printf.sprintf "base is not a commit (%s)" kind))
 
   let changed_files pull_request =
     GitStore.create ~root:local_mirror () >>= fun t ->
@@ -66,7 +66,7 @@ module RepoGit = struct
           let path = path ^ "/" ^ name in
           GitStore.read_exn t node >>= fun right ->
           (try GitStore.read t (M.find path left_map)
-           with Not_found -> return None)
+           with Not_found -> Lwt.return None)
           >>= fun left_opt ->
           (if left_opt = Some right then acc
            else match right with
@@ -80,18 +80,18 @@ module RepoGit = struct
                in
                changed_new acc path left_subtree right_subtree
              | Git.Value.Tag _ | Git.Value.Commit _ ->
-               fail (Failure "Corrupted git state")))
+               Lwt.fail (Failure "Corrupted git state")))
         acc right_tree
     in
-    changed_new (return M.empty) "" base_tree head_tree >>= fun diff ->
-    return (M.bindings diff)
+    changed_new (Lwt.return M.empty) "" base_tree head_tree >>= fun diff ->
+    Lwt.return (M.bindings diff)
 
 end
 
 module PrLint = struct
 
   let check_pull_request pr =
-    let open Lwt in
+    let open Lwt.Infix in
     log "PR received: #%d (%s from %s/%s over %s)"
       pr.number pr.head_sha pr.head_repo pr.head_ref pr.base_sha;
     RepoGit.changed_files pr >|= fun files ->
@@ -125,11 +125,15 @@ module PrLint = struct
     in
     let title =
       if errors <> [] then
-        "### :x: opam-lint errors\n\n"
+        "### :x: opam-lint errors"
       else if warnings <> [] then
-        "### :exclamation: opam-lint warnings\n\n"
+        "### :exclamation: opam-lint warnings"
       else
-        "### :white_check_mark: all lint checks passed\n\n"
+        "### :white_check_mark: all lint checks passed"
+    in
+    let title =
+      Printf.sprintf "%s <small>%s</small>\n\n"
+        title pr.head_sha
     in
     let pkgname (f,_,_) =
       OpamStd.Option.Op.(
@@ -181,8 +185,9 @@ module Github_comment = struct
      handling could be useful to e.g. update the comment rather than add a new
      one every time though. Or use more advanced authentication. *)
 
-  let push_report token pr report =
-    let open Lwt in
+  let push_report ~name ~token ~report pr =
+    (* let open Github.Monad in *)
+    let open Lwt.Infix in
     let uri =
       Uri.with_path github_api
         (Printf.sprintf "/repos/%s/issues/%d/comments"
@@ -192,7 +197,7 @@ module Github_comment = struct
     let body = Cohttp_lwt_body.of_string json in
     let headers =
       let t = Cohttp.Header.init () in
-      let t = Cohttp.Header.add_authorization t (`Basic ("opam-ci",token)) in
+      let t = Cohttp.Header.add_authorization t (`Basic (name,token)) in
       Cohttp.Header.prepend_user_agent t "Opam Continuous Integration Bot"
     in
     log "%s" report;
@@ -201,26 +206,25 @@ module Github_comment = struct
         is_success
           (code_of_status (Cohttp.Response.status resp))
       )
-    then return (log "Posted back to PR #%d." pr.number)
+    then Lwt.return (log "Posted back to PR #%d." pr.number)
     else Cohttp_lwt_body.to_string body >|= log "Error posting back: %s"
 
 end
 
 module Webhook_handler = struct
 
-  open Lwt
+  open Lwt.Infix
   open Cohttp
   open Cohttp_lwt_unix
 
-  let port = 8122
   let uri_path = "/opam-ci"
   let exp_method = `POST
   let exp_ua_prefix = "GitHub-Hookshot/"
   let exp_event = "pull_request"
   let exp_actions = ["opened"; "reopened"; "synchronize"]
 
-  let check_github req =
-    (* todo: use a secret and check github's hmac payload signature *)
+  (** Check that the request is well-formed and originated from GitHub *)
+  let check_github ~secret req body =
     let headers = Request.headers req in
     Uri.path (Request.uri req) = uri_path &&
     Request.meth req = exp_method &&
@@ -228,25 +232,15 @@ module Webhook_handler = struct
       (Header.get headers "user-agent" >>|
        OpamStd.String.starts_with ~prefix:exp_ua_prefix) +! false) &&
     Header.get_media_type headers = Some "application/json" &&
-    Header.get headers "x-github-event" = Some exp_event
+    Header.get headers "x-github-event" = Some exp_event &&
+    Header.get headers "x-hub-signature" =
+    Some (
+      Cstruct.to_string
+        (Nocrypto.Hash.mac `SHA1 ~key:secret (Cstruct.of_string body))
+    )
 
-  let server handl =
+  let server ~port ~secret ~handler =
     let callback (conn, _) req body =
-      let remote_ip = match conn with
-        | Conduit_lwt_unix.TCP { Conduit_lwt_unix.ip } -> Ipaddr.to_string ip
-        | _ -> "<>"
-      in
-      if not (check_github req) then
-        (log "Ignored invalid request from %s:\n%s" remote_ip
-           (OpamStd.Format.itemize (fun s -> s)
-              (Uri.path (Request.uri req) ::
-               Code.string_of_method (Request.meth req) ::
-               OpamStd.Option.to_string (fun x -> x)
-                 (Header.get_media_type (Request.headers req)) ::
-               OpamStd.List.filter_map (Header.get (Request.headers req))
-                 ["user-agent"; "content-type"; "x-github-event"]));
-         Server.respond_not_found ())
-      else
       let (-.-) json key = match json with
         | `O dic -> List.assoc key dic
         | _ -> log "field %s not found" key; raise Not_found
@@ -260,43 +254,102 @@ module Webhook_handler = struct
         | _ -> log "bad float"; raise Not_found
       in
       Cohttp_lwt_body.to_string body >>= fun body ->
-      let act_pr =
-        try
-          let json = OpamJson.of_string body in
-          let action = json -.- "action" |> to_string in
-          let number = json -.- "number" |> to_int in
-          let pr = json -.- "pull_request" in
-          let head = pr -.- "head" in
-          let head_ref = head -.- "ref" |> to_string in
-          let head_sha = head -.- "sha" |> to_string in
-          let head_repo = head -.- "repo" -.- "full_name" |> to_string in
-          let base_sha = pr -.- "base" -.- "sha" |> to_string in
-          Some (action, { number; head_ref; head_sha; head_repo; base_sha })
-        with
-        | Not_found ->
-          log "Error: invalid json structure from %s:\n%s"
-            remote_ip
-            (OpamJson.to_string (OpamJson.of_string body));
-          None
-        | Failure _ ->
-          log "Error: invalid json from %s:\n%s"
-            remote_ip body;
-          None
-      in
-      match act_pr with
-      | Some (act,pr) ->
-        (if List.mem act exp_actions then handl pr else return_unit) >>= fun () ->
-        Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
+      if not (check_github ~secret req body) then
+        (log "Ignored invalid request:\n%s"
+           (OpamStd.Format.itemize (fun s -> s)
+              (Uri.path (Request.uri req) ::
+               Code.string_of_method (Request.meth req) ::
+               OpamStd.Option.to_string (fun x -> x)
+                 (Header.get_media_type (Request.headers req)) ::
+               OpamStd.List.filter_map (Header.get (Request.headers req))
+                 ["user-agent"; "content-type"; "x-github-event";
+                  "x-hub-signature"]));
+         Server.respond_not_found ())
+      else
+      let json = try Some (OpamJson.of_string body) with Failure _ -> None in
+      match json with
       | None ->
-        Server.respond_error ~body:"Bad request" ()
+        log "Error: invalid json :\n%s" body;
+        Server.respond_error ~body:"Invalid JSON" ()
+      | Some json ->
+        let action =
+          try Some (json -.- "action" |> to_string)
+          with Not_found -> None
+        in
+        match action with
+        | Some a when List.mem a exp_actions ->
+          let pr =
+            try
+              let number = json -.- "number" |> to_int in
+              let pr = json -.- "pull_request" in
+              let head = pr -.- "head" in
+              let head_ref = head -.- "ref" |> to_string in
+              let head_sha = head -.- "sha" |> to_string in
+              let head_repo = head -.- "repo" -.- "full_name" |> to_string in
+              let base_sha = pr -.- "base" -.- "sha" |> to_string in
+              Some { number; head_ref; head_sha; head_repo; base_sha }
+            with Not_found -> None
+          in
+          begin match pr with
+            | Some pr ->
+              handler pr >>= fun () ->
+              Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
+            | None ->
+              log "Error: invalid Json structure:\n%s"
+                (OpamJson.to_string (OpamJson.of_string body));
+              Server.respond_error ~body:"Invalid format" ()
+          end
+        | Some _ ->
+          Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
+        | None ->
+          log "Error: could not get action from JSON:\n%s"
+            (OpamJson.to_string (OpamJson.of_string body));
+          Server.respond_error ~body:"Invalid format" ()
     in
     log "Listening on port %d" port;
     Server.create ~mode:(`TCP (`Port port)) (Server.make ~callback ())
 end
 
+module Conf = struct
+  module C = struct
+    let internal = ".opam-ci"
+
+    type t = { port: int; name: string; token: string; secret: string }
+
+    let empty = {
+      port = 8122;
+      name = "opam-ci";
+      token = "";
+      secret = "";
+    }
+
+    open OpamFormat
+
+    let of_channel filename ic =
+      let f =
+        (OpamFile.Syntax.of_channel filename ic).OpamTypes.file_contents
+      in
+      {
+        port = assoc_default 8122 f "port" parse_int;
+        name = assoc_default "opam-ci" f "name" parse_string;
+        token = assoc f "token" parse_string;
+        secret = assoc f "secret" parse_string;
+      }
+
+    let to_string _ _ = assert false
+  end
+  include C
+  include OpamFile.Make(C)
+end
+
 let () =
-  let token = Sys.argv.(1) in
-  let open Lwt in
+  let open Lwt.Infix in
+  let conf =
+    try Conf.read (OpamFilename.of_string "opam-ci.conf") with _ ->
+      prerr_endline "A file opam-ci.conf with fields `token' and `secret' (and \
+                     optionally `name' and `port') is required.";
+      exit 3
+  in
   let pr_stream, pr_push = Lwt_stream.create () in
   let rec check_loop () =
     (* The checks are done sequentially *)
@@ -304,12 +357,21 @@ let () =
       (fun () ->
          Lwt_stream.next pr_stream >>= fun pr ->
          PrLint.check_pull_request pr >>= fun report ->
-         Github_comment.push_report token pr report)
-      (fun () -> return_unit)
-      (fun exn -> log "Check failed: %s" (Printexc.to_string exn); return_unit)
+         Github_comment.push_report
+           ~name:conf.Conf.name
+           ~token:conf.Conf.token
+           ~report
+           pr)
+      (fun () -> Lwt.return_unit)
+      (fun exn ->
+         log "Check failed: %s" (Printexc.to_string exn);
+         Lwt.return_unit)
     >>= check_loop
   in
-  Lwt_main.run (join [
+  Lwt_main.run (Lwt.join [
       check_loop ();
-      Webhook_handler.server (fun pr -> return (pr_push (Some pr)));
+      Webhook_handler.server
+        ~port:conf.Conf.port
+        ~secret:(Cstruct.of_string conf.Conf.secret)
+        ~handler:(fun pr -> Lwt.return (pr_push (Some pr)));
     ])
