@@ -236,11 +236,13 @@ module Webhook_handler = struct
        OpamStd.String.starts_with ~prefix:exp_ua_prefix) +! false) &&
     Header.get_media_type headers = Some "application/json" &&
     Header.get headers "x-github-event" = Some exp_event &&
-    Header.get headers "x-hub-signature" =
-    Some (
-      Cstruct.to_string
+    OpamStd.Option.Op.(
+      Header.get headers "x-hub-signature" >>|
+      OpamStd.String.remove_prefix ~prefix:"sha1=" >>|
+      Nocrypto.Uncommon.Cs.of_hex >>|
+      Cstruct.equal
         (Nocrypto.Hash.mac `SHA1 ~key:secret (Cstruct.of_string body))
-    )
+    ) = Some true
 
   let server ~port ~secret ~handler =
     let callback (conn, _) req body =
