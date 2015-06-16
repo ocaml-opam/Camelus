@@ -1,11 +1,18 @@
 let log fmt = OpamConsole.msg (fmt ^^ "\n%!")
 
+type repo = {
+  user: string;
+  name: string;
+}
+
 type pull_request = {
   number: int;
-  head_repo: string;
+  base_repo: repo;
+  base_ref: string;
+  base_sha: string;
+  head_repo: repo;
   head_ref: string;
   head_sha: string;
-  base_sha: string;
 }
 
 module RepoGit = struct
@@ -14,15 +21,12 @@ module RepoGit = struct
   module GitStore = Git_unix.FS
   module GitSync = Git_unix.Sync.Make(GitStore)
 
-  let upstream = "ocaml/opam-repository"
+  let github_repo repo =
+    Git.Gri.of_string
+      (Printf.sprintf "git://github.com/%s/%s" repo.user repo.name)
 
-  let github_repo slug =
-    Git.Gri.of_string (Printf.sprintf "git://github.com/%s" slug)
-
-  let upstream_repo =
-    github_repo upstream
-
-  let local_mirror = "./opam-repository.git"
+  let local_mirror pr =
+    Printf.sprintf "./%s%%%s.git" pr.base_repo.user pr.base_repo.name
 
   let tree_of_sha t sha =
     log "Reading %s" (Git.SHA.to_hex sha);
@@ -38,18 +42,17 @@ module RepoGit = struct
       Lwt.fail (Failure (Printf.sprintf "base is not a commit (%s)" kind))
 
   let changed_files pull_request =
-    GitStore.create ~root:local_mirror () >>= fun t ->
+    GitStore.create ~root:(local_mirror pull_request) () >>= fun t ->
     (* Fetching upstream is actually unneeded (the remote repo should include
        the commits) -- that is, until we check that the PR is really from a
-       parent of the origin's master or signed commit. *)
-    (* GitSync.fetch t upstream_repo >>= fun _ -> *)
-    (* log "fetched upstream\n"; *)
+       parent of the origin's master or signed commit.
+       {[
+         GitSync.fetch t upstream_repo >>= fun _ ->
+         log "fetched upstream\n";
+       ]}
+    *)
     GitSync.fetch t (github_repo pull_request.head_repo) >>= fun head_fetch ->
     log "fetched user repo";
-    (* let head_ref = *)
-    (*   Git.Reference.Map.find pull_request.head_ref head_fetch.Git.Sync.Result.references *)
-    (* in *)
-    (* GitStore.write_reference t  *)
     tree_of_sha t (Git.SHA.of_hex pull_request.base_sha) >>= fun base_tree ->
     log "got base tree";
     tree_of_sha t (Git.SHA.of_hex pull_request.head_sha) >>= fun head_tree ->
@@ -92,8 +95,11 @@ module PrLint = struct
 
   let check_pull_request pr =
     let open Lwt.Infix in
-    log "PR received: #%d (%s from %s/%s over %s)"
-      pr.number pr.head_sha pr.head_repo pr.head_ref pr.base_sha;
+    log "PR received: #%d (onto %s/%s#%s from %s/%s#%s, commit %s over %s)"
+      pr.number
+      pr.base_repo.user pr.base_repo.name pr.base_ref
+      pr.head_repo.user pr.head_repo.name pr.head_ref
+      pr.head_sha pr.base_sha;
     RepoGit.changed_files pr >|= fun files ->
     let opam_files =
       List.filter (fun (s,_) ->
@@ -125,11 +131,11 @@ module PrLint = struct
     in
     let title =
       if errors <> [] then
-        "### :x: opam-lint errors"
+        "##### :x: opam-lint errors"
       else if warnings <> [] then
-        "### :exclamation: opam-lint warnings"
+        "##### :exclamation: opam-lint warnings"
       else
-        "### :white_check_mark: all lint checks passed"
+        "##### :white_check_mark: All lint checks passed"
     in
     let title =
       Printf.sprintf "%s <small>%s</small>\n\n"
@@ -144,16 +150,16 @@ module PrLint = struct
     let pass =
       OpamStd.List.concat_map ", "
         ~nil:""
-        ~left:"---\nThese packages passed lint tests: "
+        ~left:"* These packages passed lint tests: "
         ~right:"\n"
         pkgname passed
     in
     let warns =
       OpamStd.List.concat_map "\n\n"
         (fun ((_, warns, _) as fe) ->
-           Printf.sprintf "#### **%s** has some warnings:\n\n%s\n"
+           Printf.sprintf "* **%s** has some warnings:\n\n%s\n"
              (pkgname fe)
-             (OpamStd.Format.itemize ~bullet:"* "
+             (OpamStd.Format.itemize ~bullet:"  * "
                 (fun (num,_,msg) -> Printf.sprintf "**warning %d**: %s" num msg)
                 warns))
         warnings
@@ -161,9 +167,9 @@ module PrLint = struct
     let errs =
       OpamStd.List.concat_map "\n\n"
         (fun ((_, we, _) as fe) ->
-           Printf.sprintf "#### **%s** has errors:\n\n%s\n"
+           Printf.sprintf "* **%s** has errors:\n\n%s\n"
              (pkgname fe)
-             (OpamStd.Format.itemize ~bullet:"* "
+             (OpamStd.Format.itemize ~bullet:"  * "
                 (fun (num,kind,msg) ->
                    let kind = match kind with
                      | `Warning -> "warning"
@@ -186,29 +192,37 @@ module Github_comment = struct
 
   let push_report ~name ~token ~report:(status,msg) pr =
     let open Github.Monad in
-    let status =
-      let new_status_state, new_status_description =
-        match status with
-        | `Passed ->
-          `Success, Some "All opam-lint tests passed"
-        | `Warnings ps ->
-          `Success, Some ("Packages with warnings: "^String.concat " " ps)
-        | `Errors ps ->
-          `Error, Some ("Packages with errors: "^String.concat " " ps)
-      in
-      { Github_t.
-        new_status_state;
-        new_status_target_url = None;
-        new_status_description;
-      }
-    in
     run (
-      Github.Status.create
-        ~token ~user:name ~repo:RepoGit.upstream ~status ~sha:pr.head_sha ()
-      >>= fun _ ->
+      log "Commenting...";
       Github.Issue.create_comment
-        ~token ~user:name ~repo:RepoGit.upstream ~num:pr.number ~body:msg ()
+        ~token ~user:pr.base_repo.user ~repo:pr.base_repo.name
+        ~num:pr.number ~body:msg ()
       >>= fun _ ->
+      (* requires write access to the repository from the bot
+         {[
+           log "Pushing status...";
+           let status =
+             let new_status_state, new_status_description =
+               match status with
+               | `Passed ->
+                 `Success, Some "All opam-lint tests passed"
+               | `Warnings ps ->
+                 `Success, Some ("Packages with warnings: "^String.concat " " ps)
+               | `Errors ps ->
+                 `Error, Some ("Packages with errors: "^String.concat " " ps)
+             in
+             { Github_t.
+               new_status_state;
+               new_status_target_url = None;
+               new_status_description;
+             }
+           in
+           Github.Status.create
+             ~token ~user:pr.base_repo.user ~repo:pr.base_repo.name
+             ~status ~sha:pr.head_sha ()
+           >>= fun _ ->
+         ]}
+      *)
       return (log "Posted back to PR #%d." pr.number)
     )
 
@@ -247,7 +261,7 @@ module Webhook_handler = struct
   let server ~port ~secret ~handler =
     let callback (conn, _) req body =
       let (-.-) json key = match json with
-        | `O dic -> List.assoc key dic
+        | `Assoc dic -> List.assoc key dic
         | _ -> log "field %s not found" key; raise Not_found
       in
       let to_string = function
@@ -255,8 +269,8 @@ module Webhook_handler = struct
         | _ -> raise Not_found
       in
       let to_int = function
-        | `Float f -> int_of_float f
-        | _ -> log "bad float"; raise Not_found
+        | `Int i -> i
+        | _ -> raise Not_found
       in
       Cohttp_lwt_body.to_string body >>= fun body ->
       if not (check_github ~secret req body) then
@@ -271,7 +285,9 @@ module Webhook_handler = struct
                   "x-hub-signature"]));
          Server.respond_not_found ())
       else
-      let json = try Some (OpamJson.of_string body) with Failure _ -> None in
+      let json =
+        try Some (Yojson.Safe.from_string body) with Failure _ -> None
+      in
       match json with
       | None ->
         log "Error: invalid json :\n%s" body;
@@ -290,9 +306,20 @@ module Webhook_handler = struct
               let head = pr -.- "head" in
               let head_ref = head -.- "ref" |> to_string in
               let head_sha = head -.- "sha" |> to_string in
-              let head_repo = head -.- "repo" -.- "full_name" |> to_string in
-              let base_sha = pr -.- "base" -.- "sha" |> to_string in
-              Some { number; head_ref; head_sha; head_repo; base_sha }
+              let head_repo = {
+                user = head -.- "user" -.- "login" |> to_string;
+                name = head -.- "repo" -.- "name" |> to_string;
+              } in
+              let base = pr -.- "base" in
+              let base_ref = base -.- "ref" |> to_string in
+              let base_sha = base -.- "sha" |> to_string in
+              let base_repo = {
+                user = base -.- "user" -.- "login" |> to_string;
+                name = base -.- "repo" -.- "name" |> to_string;
+              } in
+              Some { number;
+                     base_repo; base_ref; base_sha;
+                     head_repo; head_ref; head_sha; }
             with Not_found -> None
           in
           begin match pr with
@@ -301,14 +328,14 @@ module Webhook_handler = struct
               Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
             | None ->
               log "Error: invalid Json structure:\n%s"
-                (OpamJson.to_string (OpamJson.of_string body));
+                (Yojson.Safe.to_string json);
               Server.respond_error ~body:"Invalid format" ()
           end
         | Some _ ->
           Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
         | None ->
           log "Error: could not get action from JSON:\n%s"
-            (OpamJson.to_string (OpamJson.of_string body));
+            (Yojson.Safe.to_string json);
           Server.respond_error ~body:"Invalid format" ()
     in
     log "Listening on port %d" port;
