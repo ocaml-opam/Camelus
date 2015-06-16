@@ -1,3 +1,5 @@
+open Lwt.Infix
+
 let log fmt = OpamConsole.msg (fmt ^^ "\n%!")
 
 type repo = {
@@ -5,43 +7,46 @@ type repo = {
   name: string;
 }
 
+type full_ref = {
+  repo: repo;
+  ref: string;
+  sha: string;
+}
+
 type pull_request = {
   number: int;
-  base_repo: repo;
-  base_ref: string;
-  base_sha: string;
-  head_repo: repo;
-  head_ref: string;
-  head_sha: string;
+  base: full_ref;
+  head: full_ref;
 }
 
 module RepoGit = struct
 
-  open Lwt.Infix
   module GitStore = Git_unix.FS
   module GitSync = Git_unix.Sync.Make(GitStore)
+  module M = OpamStd.String.Map
 
   let github_repo repo =
     Git.Gri.of_string
       (Printf.sprintf "git://github.com/%s/%s" repo.user repo.name)
 
   let local_mirror pr =
-    Printf.sprintf "./%s%%%s.git" pr.base_repo.user pr.base_repo.name
+    Printf.sprintf "./%s%%%s.git" pr.base.repo.user pr.base.repo.name
 
   let tree_of_sha t sha =
-    log "Reading %s" (Git.SHA.to_hex sha);
     GitStore.read t sha >>= function
     | Some (Git.Value.Commit c) ->
       GitStore.read t (Git.SHA.of_tree c.Git.Commit.tree) >>= (function
           | Some (Git.Value.Tree t) -> Lwt.return t
-          | _ -> Lwt.fail (Failure "invalid base tree"))
+          | _ -> Lwt.fail (Failure "invalid tree"))
     | None ->
-      Lwt.fail (Failure "base commit not found")
+      Lwt.fail (Failure (Printf.sprintf "Commit not found (%s)"
+                           (Git.SHA.to_hex sha)))
     | Some x ->
       let kind = Git.Object_type.to_string (Git.Value.type_of x) in
-      Lwt.fail (Failure (Printf.sprintf "base is not a commit (%s)" kind))
+      Lwt.fail (Failure (Printf.sprintf "Not a commit (%s: %s)"
+                           (Git.SHA.to_hex sha) kind))
 
-  let changed_files pull_request =
+  let fetch pull_request =
     GitStore.create ~root:(local_mirror pull_request) () >>= fun t ->
     (* Fetching upstream is actually unneeded (the remote repo should include
        the commits) -- that is, until we check that the PR is really from a
@@ -51,13 +56,13 @@ module RepoGit = struct
          log "fetched upstream\n";
        ]}
     *)
-    GitSync.fetch t (github_repo pull_request.head_repo) >>= fun head_fetch ->
+    GitSync.fetch t (github_repo pull_request.head.repo) >>= fun head_fetch ->
     log "fetched user repo";
-    tree_of_sha t (Git.SHA.of_hex pull_request.base_sha) >>= fun base_tree ->
-    log "got base tree";
-    tree_of_sha t (Git.SHA.of_hex pull_request.head_sha) >>= fun head_tree ->
-    log "got head tree";
-    let module M = OpamStd.String.Map in
+    Lwt.return t
+
+  let changed_files pull_request t =
+    tree_of_sha t (Git.SHA.of_hex pull_request.base.sha) >>= fun base_tree ->
+    tree_of_sha t (Git.SHA.of_hex pull_request.head.sha) >>= fun head_tree ->
     let tree_to_map path t =
       List.fold_left (fun m e ->
           M.add (path ^ "/" ^ e.Git.Tree.name) e.Git.Tree.node m)
@@ -89,18 +94,43 @@ module RepoGit = struct
     changed_new (Lwt.return M.empty) "" base_tree head_tree >>= fun diff ->
     Lwt.return (M.bindings diff)
 
+  let opam_files pr t sha =
+    let rec find_opams acc path sha =
+      GitStore.read t sha >>= function
+      | None | Some (Git.Value.Commit _) | (Some Git.Value.Tag _)-> acc
+      | Some (Git.Value.Tree d) ->
+        List.fold_left (fun acc entry ->
+            find_opams acc (entry.Git.Tree.name :: path)
+              entry.Git.Tree.node)
+          acc d
+      | Some (Git.Value.Blob b) ->
+        match path with
+        | "opam"::_ ->
+          let filename =
+            OpamFilename.of_string (String.concat "/" (List.rev path))
+          in
+          let opam =
+            try Some (OpamFile.OPAM.read_from_string ~filename
+                        (Git.Blob.to_raw b))
+            with _ -> None
+          in
+          (match opam with
+           | Some o -> acc >|= fun opams -> o::opams
+           | None -> acc)
+        | _ -> acc
+    in
+    tree_of_sha t sha >>= fun root ->
+    List.find (fun tr -> tr.Git.Tree.name = "packages") root |> fun en ->
+    find_opams (Lwt.return []) ["packages"] en.Git.Tree.node
+
 end
 
-module PrLint = struct
+module PrChecks = struct
 
-  let check_pull_request pr =
-    let open Lwt.Infix in
-    log "PR received: #%d (onto %s/%s#%s from %s/%s#%s, commit %s over %s)"
-      pr.number
-      pr.base_repo.user pr.base_repo.name pr.base_ref
-      pr.head_repo.user pr.head_repo.name pr.head_ref
-      pr.head_sha pr.base_sha;
-    RepoGit.changed_files pr >|= fun files ->
+  let pkg_to_string p = Printf.sprintf "`%s`" (OpamPackage.to_string p)
+
+  let lint pr gitstore =
+    RepoGit.changed_files pr gitstore >|= fun files ->
     let opam_files =
       List.filter (fun (s,_) ->
           OpamStd.String.starts_with ~prefix:"/packages/" s &&
@@ -139,12 +169,12 @@ module PrLint = struct
     in
     let title =
       Printf.sprintf "%s <small>%s</small>\n\n"
-        title pr.head_sha
+        title pr.head.sha
     in
     let pkgname (f,_,_) =
       OpamStd.Option.Op.(
         (OpamPackage.(of_filename OpamFilename.(of_string f))
-         >>| OpamPackage.to_string)
+         >>| pkg_to_string)
         +! f)
     in
     let pass =
@@ -186,20 +216,139 @@ module PrLint = struct
     in
     status, String.concat "" [title; errs; warns; pass]
 
+  let installable pr gitstore sha =
+    RepoGit.opam_files pr gitstore sha >>= fun opams ->
+    log "opam files at %s: %d" (Git.SHA.to_hex sha) (List.length opams);
+    let open OpamTypes in
+    let m =
+      List.fold_left (fun m o ->
+          let nv =
+            OpamPackage.create
+              (OpamFile.OPAM.name o) (OpamFile.OPAM.version o)
+          in
+          OpamPackage.Map.add nv o m)
+        OpamPackage.Map.empty opams
+    in
+    let packages =
+      OpamPackage.Set.of_list (OpamPackage.Map.keys m)
+    in
+    let universe = {
+      u_packages = packages;
+      u_action = Depends;
+      u_installed = OpamPackage.Set.empty;
+      u_available = packages; (* Todo: check for different constraints *)
+      u_depends = OpamPackage.Map.map OpamFile.OPAM.depends m;
+      u_depopts = OpamPackage.Map.map OpamFile.OPAM.depopts m;
+      u_conflicts = OpamPackage.Map.map OpamFile.OPAM.conflicts m;
+      u_installed_roots = OpamPackage.Set.empty;
+      u_pinned = OpamPackage.Set.empty;
+      u_base = OpamPackage.Set.empty;
+      u_test = false;
+      u_doc = false;
+    } in
+    Lwt.return (packages, OpamSolver.installable universe)
+
+  let installability_check pr gitstore =
+    installable pr gitstore (Git.SHA.of_hex pr.base.sha)
+    >>= fun (packages_before, installable_before) ->
+    installable pr gitstore (Git.SHA.of_hex pr.head.sha)
+    >>= fun (packages_after, installable_after) ->
+    let open OpamPackage.Set.Op in
+    let fresh = packages_after -- packages_before in
+    let broken_before = packages_before -- installable_before in
+    log "Broken: %s" (OpamPackage.Set.to_string broken_before);
+    let broken_after = packages_after -- installable_after in
+    log "Broken (after): %s" (OpamPackage.Set.to_string broken_after);
+    let breaks = broken_after -- broken_before in
+    let repairs = broken_before -- broken_after in
+    let no_breaks = OpamPackage.Set.is_empty breaks in
+    let title =
+      Printf.sprintf "\n\n##### :%s: Installability check (%d &rarr; %d)\n\n"
+        (if no_breaks then "white_check_mark" else "exclamation")
+        (OpamPackage.Set.cardinal installable_before)
+        (OpamPackage.Set.cardinal installable_after)
+    in
+    let msg (s,set) =
+      if OpamPackage.Set.is_empty set then None else
+        Some (Printf.sprintf "%s (%d): %s" s
+                (OpamPackage.Set.cardinal set)
+                (OpamStd.List.concat_map " " pkg_to_string
+                   (OpamPackage.Set.elements set)))
+    in
+    let status =
+      if no_breaks then `Passed else
+        `Errors (List.map pkg_to_string
+                   (OpamPackage.Set.elements breaks))
+    in
+    Lwt.return (
+      status,
+      title ^
+      OpamStd.Format.itemize ~bullet:"* " (fun s -> s) @@
+      OpamStd.List.filter_map msg [
+        "these releases are **not installable** anymore",
+        breaks %% packages_before;
+        "these releases can now be installed, well done",
+        repairs %% packages_after;
+        "new installable packages",
+        fresh %% installable_after;
+        "new **broken** packages",
+        fresh -- installable_after;
+        "removed broken packages",
+        broken_before -- packages_after;
+        "removed installable packages",
+        installable_before -- packages_after;
+      ]
+    )
+
+  let add_status st1 st2 = match st1, st2 with
+    | `Errors a, `Errors b -> `Errors (a@b)
+    | `Errors _ as e, _ | _, (`Errors _ as e) -> e
+    | `Warnings a, `Warnings b -> `Warnings (a@b)
+    | `Warnings _ as w, _ | _, (`Warnings _ as w) -> w
+    | `Passed, `Passed -> `Passed
+
+  let run pr =
+    RepoGit.fetch pr >>= fun gitstore ->
+    lint pr gitstore >>= fun (stlint,msglint) ->
+    installability_check pr gitstore >>= fun (stinst,msginst) ->
+    Lwt.return (add_status stlint stinst,
+                msglint ^ "\n\n---\n" ^ msginst)
+
 end
 
 module Github_comment = struct
 
-  let push_report ~name ~token ~report:(status,msg) pr =
+  let push_report ~name ~token ~report:(status,body) pr =
     let open Github.Monad in
-    run (
+    let open Github_t in
+    let user = pr.base.repo.user in
+    let repo = pr.base.repo.name in
+    let num = pr.number in
+    let comment () =
       log "Commenting...";
-      Github.Issue.create_comment
-        ~token ~user:pr.base_repo.user ~repo:pr.base_repo.name
-        ~num:pr.number ~body:msg ()
-      >>= fun _ ->
-      (* requires write access to the repository from the bot
-         {[
+      let rec find_comment stream =
+        Github.Stream.next stream >>= function
+        | Some (c, s) ->
+          if c.issue_comment_user.user_login = name then return (Some c)
+          else find_comment s
+        | None -> return None
+      in
+      find_comment (Github.Issue.comments ~token ~user ~repo ~num ())
+      >>= function
+      | None ->
+        Github.Issue.create_comment ~token ~user ~repo ~num ~body ()
+      | Some c -> (* not in ocaml-github API yet *)
+        let body =
+          Github_j.string_of_new_issue_comment { new_issue_comment_body = body }
+        in
+        let num = Int64.to_int c.issue_comment_id in
+        let uri = Github.URI.issue_comment ~user ~repo ~num in
+        Github.API.patch ~expected_code:`OK ~token ~body ~uri
+          (fun b -> Lwt.return (Github_j.issue_comment_of_string b))
+    in
+    (* requires write access to the repository from the bot
+       {[
+         let push_status () =
            log "Pushing status...";
            let status =
              let new_status_state, new_status_description =
@@ -218,11 +367,15 @@ module Github_comment = struct
              }
            in
            Github.Status.create
-             ~token ~user:pr.base_repo.user ~repo:pr.base_repo.name
-             ~status ~sha:pr.head_sha ()
+             ~token ~user:pr.base.repo.user ~repo:pr.base.repo.name
+             ~status ~sha:pr.head.sha ()
            >>= fun _ ->
-         ]}
-      *)
+         in
+       ]}
+    *)
+    run (
+      comment () >>= fun _ ->
+      (* push_status () >>= fun _ -> *)
       return (log "Posted back to PR #%d." pr.number)
     )
 
@@ -230,7 +383,6 @@ end
 
 module Webhook_handler = struct
 
-  open Lwt.Infix
   open Cohttp
   open Cohttp_lwt_unix
 
@@ -249,7 +401,7 @@ module Webhook_handler = struct
       (Header.get headers "user-agent" >>|
        OpamStd.String.starts_with ~prefix:exp_ua_prefix) +! false) &&
     Header.get_media_type headers = Some "application/json" &&
-    Header.get headers "x-github-event" = Some exp_event &&
+    Header.get headers "x-github-event" <> None &&
     OpamStd.Option.Op.(
       Header.get headers "x-hub-signature" >>|
       OpamStd.String.remove_prefix ~prefix:"sha1=" >>|
@@ -281,9 +433,14 @@ module Webhook_handler = struct
                OpamStd.Option.to_string (fun x -> x)
                  (Header.get_media_type (Request.headers req)) ::
                OpamStd.List.filter_map (Header.get (Request.headers req))
-                 ["user-agent"; "content-type"; "x-github-event";
-                  "x-hub-signature"]));
+                 ["user-agent"; "content-type";
+                  "x-hub-signature";  "x-github-event"; ]));
          Server.respond_not_found ())
+      else
+      if Header.get (Request.headers req) "x-github-event" <> Some exp_event
+      then
+        (log "Ignored non pull-request action";
+         Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ())
       else
       let json =
         try Some (Yojson.Safe.from_string body) with Failure _ -> None
@@ -303,23 +460,15 @@ module Webhook_handler = struct
             try
               let number = json -.- "number" |> to_int in
               let pr = json -.- "pull_request" in
-              let head = pr -.- "head" in
-              let head_ref = head -.- "ref" |> to_string in
-              let head_sha = head -.- "sha" |> to_string in
-              let head_repo = {
-                user = head -.- "user" -.- "login" |> to_string;
-                name = head -.- "repo" -.- "name" |> to_string;
+              let full_repo r = {
+                repo = { user = r -.- "user" -.- "login" |> to_string;
+                         name = r -.- "repo" -.- "name" |> to_string; };
+                ref = r -.- "ref" |> to_string;
+                sha = r -.- "sha" |> to_string;
               } in
-              let base = pr -.- "base" in
-              let base_ref = base -.- "ref" |> to_string in
-              let base_sha = base -.- "sha" |> to_string in
-              let base_repo = {
-                user = base -.- "user" -.- "login" |> to_string;
-                name = base -.- "repo" -.- "name" |> to_string;
-              } in
-              Some { number;
-                     base_repo; base_ref; base_sha;
-                     head_repo; head_ref; head_sha; }
+              let base = full_repo (pr -.- "base") in
+              let head = full_repo (pr -.- "head") in
+              Some { number; base; head }
             with Not_found -> None
           in
           begin match pr with
@@ -357,16 +506,20 @@ module Conf = struct
 
     open OpamFormat
 
-    let of_channel filename ic =
-      let f =
-        (OpamFile.Syntax.of_channel filename ic).OpamTypes.file_contents
-      in
+    let of_syntax s =
+      let f = s.OpamTypes.file_contents in
       {
         port = assoc_default 8122 f "port" parse_int;
         name = assoc_default "opam-ci" f "name" parse_string;
         token = Github.Token.of_string (assoc f "token" parse_string);
         secret = Cstruct.of_string (assoc f "secret" parse_string);
       }
+
+    let of_channel filename ic =
+      of_syntax (OpamFile.Syntax.of_channel filename ic)
+
+    let of_string filename str =
+      of_syntax (OpamFile.Syntax.of_string filename str)
 
     let to_string _ _ = assert false
   end
@@ -375,7 +528,6 @@ module Conf = struct
 end
 
 let () =
-  let open Lwt.Infix in
   let conf =
     try Conf.read (OpamFilename.of_string "opam-ci.conf") with _ ->
       prerr_endline "A file opam-ci.conf with fields `token' and `secret' (and \
@@ -388,7 +540,13 @@ let () =
     Lwt.try_bind
       (fun () ->
          Lwt_stream.next pr_stream >>= fun pr ->
-         PrLint.check_pull_request pr >>= fun report ->
+         log "=> PR #%d received \
+              (onto %s/%s#%s from %s/%s#%s, commit %s over %s)"
+           pr.number
+           pr.base.repo.user pr.base.repo.name pr.base.ref
+           pr.head.repo.user pr.head.repo.name pr.head.ref
+           pr.head.sha pr.base.sha;
+         PrChecks.run pr >>= fun report ->
          Github_comment.push_report
            ~name:conf.Conf.name
            ~token:conf.Conf.token
