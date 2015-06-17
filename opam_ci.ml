@@ -47,19 +47,25 @@ module RepoGit = struct
   let local_mirror pr =
     Printf.sprintf "./%s%%%s.git" pr.base.repo.user pr.base.repo.name
 
-  let tree_of_sha t sha =
-    GitStore.read t sha >>= function
-    | Some (Git.Value.Commit c) ->
-      GitStore.read t (Git.SHA.of_tree c.Git.Commit.tree) >>= (function
-          | Some (Git.Value.Tree t) -> Lwt.return t
-          | _ -> Lwt.fail (Failure "invalid tree"))
-    | None ->
-      Lwt.fail (Failure (Printf.sprintf "Commit not found (%s)"
-                           (Git.SHA.to_hex sha)))
-    | Some x ->
+  let get_commit t sha =
+    GitStore.read_exn t sha >>= function
+    | Git.Value.Commit c -> Lwt.return c
+    | x ->
       let kind = Git.Object_type.to_string (Git.Value.type_of x) in
       Lwt.fail (Failure (Printf.sprintf "Not a commit (%s: %s)"
                            (Git.SHA.to_hex sha) kind))
+
+  let get_tree t sha =
+    GitStore.read_exn t sha >>= function
+    | Git.Value.Tree t -> Lwt.return t
+    | x ->
+      let kind = Git.Object_type.to_string (Git.Value.type_of x) in
+      Lwt.fail (Failure (Printf.sprintf "Not a tree (%s: %s)"
+                           (Git.SHA.to_hex sha) kind))
+
+  let tree_of_commit_sha t sha =
+    get_commit t sha >>= fun c ->
+    get_tree t (Git.SHA.of_tree c.Git.Commit.tree)
 
   let fetch pull_request =
     GitStore.create ~root:(local_mirror pull_request) () >>= fun t ->
@@ -75,9 +81,36 @@ module RepoGit = struct
     log "fetched user repo";
     Lwt.return t
 
-  let changed_files pull_request t =
-    tree_of_sha t (Git.SHA.of_hex pull_request.base.sha) >>= fun base_tree ->
-    tree_of_sha t (Git.SHA.of_hex pull_request.head.sha) >>= fun head_tree ->
+  let common_ancestor pull_request t =
+    let module S = Git.SHA.Set in
+    let all_parents shas =
+      S.fold (fun sha acc ->
+          get_commit t sha >>= fun c ->
+          acc >|= fun s ->
+          List.fold_left (fun s x -> S.add (Git.SHA.of_commit x) s)
+            s c.Git.Commit.parents)
+        shas (Lwt.return S.empty)
+    in
+    let rec up parents_base parents_head bases heads =
+      if S.is_empty bases && S.is_empty heads then
+        Lwt.fail (Failure "No common ancestor found")
+      else
+      let common =
+        S.union (S.inter parents_base heads) (S.inter parents_head bases)
+      in
+      if not (S.is_empty common) then Lwt.return (S.choose common) else
+        all_parents bases >>= fun bases ->
+        all_parents heads >>= fun heads ->
+        up (S.union parents_base bases) (S.union parents_head heads)
+          bases heads
+    in
+    let bases = S.singleton (Git.SHA.of_hex pull_request.base.sha) in
+    let heads = S.singleton (Git.SHA.of_hex pull_request.head.sha) in
+    up bases heads bases heads
+
+  let changed_files base head t =
+    tree_of_commit_sha t base >>= fun base_tree ->
+    tree_of_commit_sha t head >>= fun head_tree ->
     let tree_to_map path t =
       List.fold_left (fun m e ->
           M.add (path ^ "/" ^ e.Git.Tree.name) e.Git.Tree.node m)
@@ -109,7 +142,7 @@ module RepoGit = struct
     changed_new (Lwt.return M.empty) "" base_tree head_tree >>= fun diff ->
     Lwt.return (M.bindings diff)
 
-  let opam_files pr t sha =
+  let opam_files t sha =
     let rec find_opams acc path sha =
       GitStore.read t sha >>= function
       | None | Some (Git.Value.Commit _) | (Some Git.Value.Tag _)-> acc
@@ -134,7 +167,7 @@ module RepoGit = struct
            | None -> acc)
         | _ -> acc
     in
-    tree_of_sha t sha >>= fun root ->
+    tree_of_commit_sha t sha >>= fun root ->
     List.find (fun tr -> tr.Git.Tree.name = "packages") root |> fun en ->
     find_opams (Lwt.return []) ["packages"] en.Git.Tree.node
 
@@ -144,8 +177,8 @@ module PrChecks = struct
 
   let pkg_to_string p = Printf.sprintf "`%s`" (OpamPackage.to_string p)
 
-  let lint pr gitstore =
-    RepoGit.changed_files pr gitstore >|= fun files ->
+  let lint ancestor head gitstore =
+    RepoGit.changed_files ancestor head gitstore >|= fun files ->
     let opam_files =
       List.filter (fun (s,_) ->
           OpamStd.String.starts_with ~prefix:"/packages/" s &&
@@ -179,12 +212,14 @@ module PrChecks = struct
         "##### :x: opam-lint errors"
       else if warnings <> [] then
         "##### :exclamation: opam-lint warnings"
-      else
+      else if passed <> [] then
         "##### :white_check_mark: All lint checks passed"
+      else
+        "##### :white_check_mark: No new or changed opam files"
     in
     let title =
       Printf.sprintf "%s <small>%s</small>\n\n"
-        title pr.head.sha
+        title (Git.SHA.to_hex head)
     in
     let pkgname (f,_,_) =
       OpamStd.Option.Op.(
@@ -231,8 +266,8 @@ module PrChecks = struct
     in
     status, String.concat "" [title; errs; warns; pass]
 
-  let installable pr gitstore sha =
-    RepoGit.opam_files pr gitstore sha >>= fun opams ->
+  let installable gitstore sha =
+    RepoGit.opam_files gitstore sha >>= fun opams ->
     log "opam files at %s: %d" (Git.SHA.to_hex sha) (List.length opams);
     let open OpamTypes in
     let m =
@@ -263,10 +298,10 @@ module PrChecks = struct
     } in
     Lwt.return (packages, OpamSolver.installable universe)
 
-  let installability_check pr gitstore =
-    installable pr gitstore (Git.SHA.of_hex pr.base.sha)
+  let installability_check ancestor head gitstore =
+    installable gitstore ancestor
     >>= fun (packages_before, installable_before) ->
-    installable pr gitstore (Git.SHA.of_hex pr.head.sha)
+    installable gitstore head
     >>= fun (packages_after, installable_after) ->
     let open OpamPackage.Set.Op in
     let fresh = packages_after -- packages_before in
@@ -324,8 +359,10 @@ module PrChecks = struct
 
   let run pr =
     RepoGit.fetch pr >>= fun gitstore ->
-    lint pr gitstore >>= fun (stlint,msglint) ->
-    installability_check pr gitstore >>= fun (stinst,msginst) ->
+    let head = Git.SHA.of_hex pr.head.sha in
+    RepoGit.common_ancestor pr gitstore >>= fun ancestor ->
+    lint ancestor head gitstore >>= fun (stlint,msglint) ->
+    installability_check ancestor head gitstore >>= fun (stinst,msginst) ->
     Lwt.return (add_status stlint stinst,
                 msglint ^ "\n\n---\n" ^ msginst)
 
