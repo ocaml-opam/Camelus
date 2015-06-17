@@ -306,9 +306,7 @@ module PrChecks = struct
     let open OpamPackage.Set.Op in
     let fresh = packages_after -- packages_before in
     let broken_before = packages_before -- installable_before in
-    log "Broken: %s" (OpamPackage.Set.to_string broken_before);
     let broken_after = packages_after -- installable_after in
-    log "Broken (after): %s" (OpamPackage.Set.to_string broken_after);
     let breaks = broken_after -- broken_before in
     let repairs = broken_before -- broken_after in
     let no_breaks = OpamPackage.Set.is_empty breaks in
