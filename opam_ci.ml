@@ -200,7 +200,7 @@ module PrChecks = struct
           file, r, opamopt)
         opam_files
     in
-    let unwanted_warns = [21] in
+    let unwanted_warns = [] in
     let lint =
       List.map (fun (f,r,o) ->
           f, List.filter (fun (n,_,_) -> not (List.mem n unwanted_warns)) r, o)
