@@ -83,13 +83,12 @@ module RepoGit = struct
 
   let common_ancestor pull_request t =
     let module S = Git.SHA.Set in
-    let all_parents shas =
-      S.fold (fun sha acc ->
-          get_commit t sha >>= fun c ->
-          acc >|= fun s ->
-          List.fold_left (fun s x -> S.add (Git.SHA.of_commit x) s)
-            s c.Git.Commit.parents)
-        shas (Lwt.return S.empty)
+    let rec all_parents shas acc = match shas with
+      | [] -> Lwt.return acc
+      | sha::shas ->
+        get_commit t sha >|= fun c ->
+        List.fold_left (fun s x -> S.add (Git.SHA.of_commit x) s)
+          acc c.Git.Commit.parents
     in
     let rec up parents_base parents_head bases heads =
       if S.is_empty bases && S.is_empty heads then
@@ -99,8 +98,8 @@ module RepoGit = struct
         S.union (S.inter parents_base heads) (S.inter parents_head bases)
       in
       if not (S.is_empty common) then Lwt.return (S.choose common) else
-        all_parents bases >>= fun bases ->
-        all_parents heads >>= fun heads ->
+        all_parents (S.elements bases) S.empty >>= fun bases ->
+        all_parents (S.elements heads) S.empty  >>= fun heads ->
         up (S.union parents_base bases) (S.union parents_head heads)
           bases heads
     in
@@ -118,39 +117,47 @@ module RepoGit = struct
     in
     let rec changed_new acc path left_tree right_tree =
       let left_map = tree_to_map path left_tree in
-      List.fold_left (fun acc { Git.Tree.name; node; _ } ->
+      let rec read acc = function
+        | [] -> Lwt.return acc
+        | { Git.Tree.name; node; _ } :: right_tree ->
           let path = path ^ "/" ^ name in
           GitStore.read_exn t node >>= fun right ->
           (try GitStore.read t (M.find path left_map)
            with Not_found -> Lwt.return None)
           >>= fun left_opt ->
-          (if left_opt = Some right then acc
-           else match right with
-             | Git.Value.Blob b ->
-               acc >|= M.add path (Git.Blob.to_raw b)
-             | Git.Value.Tree right_subtree ->
-               let left_subtree =
-                 match left_opt with
-                 | Some (Git.Value.Tree t) -> t
-                 | _ -> []
-               in
-               changed_new acc path left_subtree right_subtree
-             | Git.Value.Tag _ | Git.Value.Commit _ ->
-               Lwt.fail (Failure "Corrupted git state")))
-        acc right_tree
+          if left_opt = Some right then read acc right_tree
+          else match right with
+            | Git.Value.Blob b ->
+              read (M.add path (Git.Blob.to_raw b) acc) right_tree
+            | Git.Value.Tree right_subtree ->
+              let left_subtree =
+                match left_opt with
+                | Some (Git.Value.Tree t) -> t
+                | _ -> []
+              in
+              changed_new acc path left_subtree right_subtree >>= fun acc ->
+              read acc right_tree
+            | Git.Value.Tag _ | Git.Value.Commit _ ->
+              Lwt.fail (Failure "Corrupted git state")
+      in
+      read acc right_tree
     in
-    changed_new (Lwt.return M.empty) "" base_tree head_tree >>= fun diff ->
+    changed_new M.empty "" base_tree head_tree >>= fun diff ->
     Lwt.return (M.bindings diff)
 
   let opam_files t sha =
     let rec find_opams acc path sha =
       GitStore.read t sha >>= function
-      | None | Some (Git.Value.Commit _) | (Some Git.Value.Tag _)-> acc
-      | Some (Git.Value.Tree d) ->
-        List.fold_left (fun acc entry ->
-            find_opams acc (entry.Git.Tree.name :: path)
-              entry.Git.Tree.node)
-          acc d
+      | None | Some (Git.Value.Commit _) | Some (Git.Value.Tag _) ->
+        Lwt.return acc
+      | Some (Git.Value.Tree dir) ->
+        let rec find_in_dir dir acc = match dir with
+          | [] -> Lwt.return acc
+          | entry::dir ->
+            find_opams acc (entry.Git.Tree.name :: path) entry.Git.Tree.node
+            >>= find_in_dir dir
+        in
+        find_in_dir dir acc
       | Some (Git.Value.Blob b) ->
         match path with
         | "opam"::_ ->
@@ -163,13 +170,13 @@ module RepoGit = struct
             with _ -> None
           in
           (match opam with
-           | Some o -> acc >|= fun opams -> o::opams
-           | None -> acc)
-        | _ -> acc
+           | Some o -> Lwt.return (o::acc)
+           | None -> Lwt.return acc)
+        | _ -> Lwt.return acc
     in
     tree_of_commit_sha t sha >>= fun root ->
     List.find (fun tr -> tr.Git.Tree.name = "packages") root |> fun en ->
-    find_opams (Lwt.return []) ["packages"] en.Git.Tree.node
+    find_opams [] ["packages"] en.Git.Tree.node
 
 end
 
