@@ -87,30 +87,57 @@ module RepoGit = struct
     Lwt.return t
 
   let common_ancestor pull_request t =
+    log "Looking up common ancestor...";
+    let seen = Hashtbl.create 137 in
     let module S = Git.SHA.Set in
-    let rec all_parents shas acc = match shas with
-      | [] -> Lwt.return acc
-      | sha::shas ->
-        get_commit t sha >|= fun c ->
-        List.fold_left (fun s x -> S.add (Git.SHA.of_commit x) s)
-          acc c.Git.Commit.parents
+    let (++), (--), (%%) = S.union, S.diff, S.inter in
+    let all_parents s =
+      Lwt_list.fold_left_s (fun acc sha ->
+          try Lwt.return (acc ++ Hashtbl.find seen sha) with Not_found ->
+            get_commit t sha >|= fun c ->
+            let p = S.of_list Git.(List.map SHA.of_commit c.Commit.parents) in
+            Hashtbl.add seen sha p;
+            acc ++ p)
+        S.empty (S.elements s)
     in
-    let rec up parents_base parents_head bases heads =
-      if S.is_empty bases && S.is_empty heads then
-        Lwt.fail (Failure "No common ancestor found")
-      else
-      let common =
-        S.union (S.inter parents_base heads) (S.inter parents_head bases)
+    let seen_ancestors s =
+      let rec aux acc s =
+        if S.is_empty s then acc else
+        let parents =
+          S.fold (fun sha acc ->
+              try acc ++ Hashtbl.find seen sha with Not_found -> acc)
+            s S.empty
+        in
+        aux (acc ++ parents) (parents -- acc)
       in
-      if not (S.is_empty common) then Lwt.return (S.choose common) else
-        all_parents (S.elements bases) S.empty >>= fun bases ->
-        all_parents (S.elements heads) S.empty  >>= fun heads ->
-        up (S.union parents_base bases) (S.union parents_head heads)
-          bases heads
+      aux s s
     in
-    let bases = S.singleton (Git.SHA.of_hex pull_request.base.sha) in
-    let heads = S.singleton (Git.SHA.of_hex pull_request.head.sha) in
-    up bases heads bases heads
+    let rec all_common descendents current descendents' current' =
+      let current = current -- descendents' in
+      if S.is_empty current then
+        let common = descendents %% descendents' in
+        if S.subset current' (seen_ancestors common) then Lwt.return common
+        else all_common descendents' current' descendents current
+      else
+      all_parents current >>= fun current ->
+      all_common descendents' current'
+        (descendents ++ current) (current -- descendents)
+    in
+    let base = S.singleton (Git.SHA.of_hex pull_request.base.sha) in
+    let head = S.singleton (Git.SHA.of_hex pull_request.head.sha) in
+    all_common base base head head >>= fun common ->
+    let rec remove_older ancestors = fun s ->
+      if S.is_empty s || S.is_empty ancestors ||
+         S.subset s (S.singleton (S.choose s))
+      then Lwt.return s
+      else
+        all_parents ancestors >>= fun ancestors ->
+        remove_older (ancestors -- s) (s -- ancestors)
+    in
+    remove_older common common >|= fun found ->
+    log "found: %s"
+      (OpamStd.List.concat_map " " Git.SHA.to_hex (S.elements found));
+    S.choose found
 
   let changed_files base head t =
     tree_of_commit_sha t base >>= fun base_tree ->
