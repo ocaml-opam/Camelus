@@ -374,9 +374,13 @@ module PrChecks = struct
     let head = Git.SHA.of_hex pr.head.sha in
     RepoGit.common_ancestor pr gitstore >>= fun ancestor ->
     lint ancestor head gitstore >>= fun (stlint,msglint) ->
-    installability_check ancestor head gitstore >>= fun (stinst,msginst) ->
-    Lwt.return (add_status stlint stinst,
-                msglint ^ "\n\n---\n" ^ msginst)
+    Lwt.catch (fun () ->
+      installability_check ancestor head gitstore >>= fun (stinst,msginst) ->
+      Lwt.return (add_status stlint stinst,
+                  msglint ^ "\n\n---\n" ^ msginst))
+      (fun e ->
+        log "Installability check failed: %s" (Printexc.to_string e);
+        Lwt.return (stlint, msglint))
 
 end
 
