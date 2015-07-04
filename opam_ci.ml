@@ -623,14 +623,22 @@ module Conf = struct
 end
 
 let replay_prs = [
-  { number = 4275;
-    base = { sha = "04b239b8737238af5298d51061b5f51af8d58528";
+  { number = 4288;
+    base = { sha = "d09b4850f04bc18b6ac723c406c2b745630985fc";
              repo = { user = "ocaml"; name = "opam-repository" };
              ref = "master" };
-    head = { sha = "4b128e39e3689a425f3c908a1c2eb29740cdd914";
+    head = { sha = "ddd60d2670e7b7858329f5b75826b36e56643cf6";
              repo = { user = "ocaml"; name = "opam-repository" };
-             ref = "annot.1.1.0" };
+             ref = "c3.0.3.0" };
   };
+  (* { number = 4275; *)
+  (*   base = { sha = "04b239b8737238af5298d51061b5f51af8d58528"; *)
+  (*            repo = { user = "ocaml"; name = "opam-repository" }; *)
+  (*            ref = "master" }; *)
+  (*   head = { sha = "4b128e39e3689a425f3c908a1c2eb29740cdd914"; *)
+  (*            repo = { user = "ocaml"; name = "opam-repository" }; *)
+  (*            ref = "annot.1.1.0" }; *)
+  (* }; *)
   (* { number = 4253; *)
   (*   base = { sha = "39e750c36a4a79cccd9f5dcfe116a90760de53b1"; *)
   (*            repo = { user = "ocaml"; name = "opam-repository" }; *)
