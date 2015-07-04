@@ -501,7 +501,7 @@ module Webhook_handler = struct
       Header.get headers "x-hub-signature" >>|
       OpamStd.String.remove_prefix ~prefix:"sha1=" >>|
       Nocrypto.Uncommon.Cs.of_hex >>|
-      Cstruct.equal
+      (=)
         (Nocrypto.Hash.mac `SHA1 ~key:secret (Cstruct.of_string body))
     ) = Some true
 
@@ -622,13 +622,75 @@ module Conf = struct
   include OpamFile.Make(C)
 end
 
+let replay_prs = [
+  { number = 4275;
+    base = { sha = "04b239b8737238af5298d51061b5f51af8d58528";
+             repo = { user = "ocaml"; name = "opam-repository" };
+             ref = "master" };
+    head = { sha = "4b128e39e3689a425f3c908a1c2eb29740cdd914";
+             repo = { user = "ocaml"; name = "opam-repository" };
+             ref = "annot.1.1.0" };
+  };
+  (* { number = 4253; *)
+  (*   base = { sha = "39e750c36a4a79cccd9f5dcfe116a90760de53b1"; *)
+  (*            repo = { user = "ocaml"; name = "opam-repository" }; *)
+  (*            ref = "master" }; *)
+  (*   head = { sha = "d256016439aead935614c7649bc5abfdd0d7e0c4"; *)
+  (*            repo = { user = "planar"; name = "opam-repository" }; *)
+  (*            ref = "slap-fix-dep" }; *)
+  (* }; *)
+  (* { number = 4247; *)
+  (*   base = { sha = "cec158e0194a8dfaf6cd0a604240304d7f90d82f"; *)
+  (*            repo = { user = "ocaml"; name = "opam-repository" }; *)
+  (*            ref = "master" }; *)
+  (*   head = { sha = "23904af27989200233f58b5f5929d0b3bb98e048"; *)
+  (*            repo = { user = "samoht"; name = "opam-repository" }; *)
+  (*            ref = "master" }; *)
+  (* }; *)
+  (* { number = 4254; *)
+  (*   base = { sha = "ccc57122be7a77b78fb95e0b1d79f32c6d53e8b8"; *)
+  (*            repo = { user = "ocaml"; name = "opam-repository" }; *)
+  (*            ref = "master" }; *)
+  (*   head = { sha = "67921cccc78b7f296b86b5c99cf44aa95885dffd"; *)
+  (*            repo = { user = "planar"; name = "opam-repository" }; *)
+  (*            ref = "add-official-4.02.2-release" }; *)
+  (* }; *)
+  (* { number = 4255; *)
+  (*   base = { sha = "dd24334b14e53ea3ccddee303b0a80ee26d45081"; *)
+  (*            repo = { user = "ocaml"; name = "opam-repository" }; *)
+  (*            ref = "master" }; *)
+  (*   head = { sha = "a03d0f225d34f40bfbd871dfb48c660bd1f23517"; *)
+  (*            repo = { user = "dbuenzli"; name = "opam-repository" }; *)
+  (*            ref = "opam-publish/uucd.3.0.0" }; *)
+  (* }; *)
+  (* (\* { number = ; *\) *)
+  (* (\*   base = { sha = ""; *\) *)
+  (* (\*            repo = { user = "ocaml"; name = "opam-repository" }; *\) *)
+  (* (\*            ref = "master" }; *\) *)
+  (* (\*   head = { sha = ""; *\) *)
+  (* (\*            repo = { user = ""; name = "opam-repository" }; *\) *)
+  (* (\*            ref = "master" }; *\) *)
+  (* (\* }; *\) *)
+  (* { number = 4269; *)
+  (*   base = { sha = "7596688af050dfdb1f0389266ee90d44a860ce3a"; *)
+  (*            repo = { user = "ocaml"; name = "opam-repository" }; *)
+  (*            ref = "master" }; *)
+  (*   head = { sha = "b59b6467d6ed411f4624b0c3b8c8a67ef938cd11"; *)
+  (*            repo = { user = "camlunity"; name = "opam-repository" }; *)
+  (*            ref = "master" }; *)
+  (* }; *)
+]
+
+
 let () =
+(*
   let conf =
     try Conf.read (OpamFilename.of_string "opam-ci.conf") with _ ->
       prerr_endline "A file opam-ci.conf with fields `token' and `secret' (and \
                      optionally `name' and `port') is required.";
       exit 3
   in
+*)
   let pr_stream, pr_push = Lwt_stream.create () in
   let rec check_loop gitstore =
     (* The checks are done sequentially *)
@@ -642,11 +704,12 @@ let () =
             pr.head.repo.user pr.head.repo.name pr.head.ref
             pr.head.sha pr.base.sha;
           PrChecks.run pr gitstore >>= fun report ->
-          Github_comment.push_report
-            ~name:conf.Conf.name
-            ~token:conf.Conf.token
-            ~report
-            pr)
+          Lwt.return (prerr_endline (snd report))
+          (* Github_comment.push_report *)
+          (*   ~name:conf.Conf.name *)
+          (*   ~token:conf.Conf.token *)
+          (*   ~report *)
+          (*   pr *))
        (function
          | Lwt_stream.Empty -> exit 0
          | exn ->
@@ -654,10 +717,14 @@ let () =
            Lwt.return_unit)
     >>= fun () -> check_loop gitstore
   in
+  let rec get_pr_loop = function
+    | [] -> Lwt.return (pr_push None)
+    | pr::prs ->
+      pr_push (Some pr);
+      Lwt_unix.sleep 1. >>= fun () ->
+      get_pr_loop prs
+  in
   Lwt_main.run (Lwt.join [
       RepoGit.get {user="ocaml";name="opam-repository"} >>= check_loop;
-      Webhook_handler.server
-        ~port:conf.Conf.port
-        ~secret:conf.Conf.secret
-        ~handler:(fun pr -> Lwt.return (pr_push (Some pr)));
+      get_pr_loop replay_prs;
     ])
