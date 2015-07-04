@@ -44,16 +44,19 @@ module RepoGit = struct
     Git.Gri.of_string
       (Printf.sprintf "git://github.com/%s/%s" repo.user repo.name)
 
-  let local_mirror pr =
-    Printf.sprintf "./%s%%%s.git" pr.base.repo.user pr.base.repo.name
+  let local_mirror repo =
+    Printf.sprintf "./%s%%%s.git" repo.user repo.name
 
   let get_commit t sha =
-    GitStore.read_exn t sha >>= function
-    | Git.Value.Commit c -> Lwt.return c
-    | x ->
+    GitStore.read t sha >>= function
+    | Some (Git.Value.Commit c) -> Lwt.return c
+    | Some x ->
       let kind = Git.Object_type.to_string (Git.Value.type_of x) in
       Lwt.fail (Failure (Printf.sprintf "Not a commit (%s: %s)"
                            (Git.SHA.to_hex sha) kind))
+    | None ->
+      Lwt.fail (Failure (Printf.sprintf "Commit %s not found"
+                           (Git.SHA.to_hex sha)))
 
   let get_tree t sha =
     GitStore.read_exn t sha >>= function
@@ -67,8 +70,10 @@ module RepoGit = struct
     get_commit t sha >>= fun c ->
     get_tree t (Git.SHA.of_tree c.Git.Commit.tree)
 
-  let fetch pull_request =
-    GitStore.create ~root:(local_mirror pull_request) () >>= fun t ->
+  let get repo =
+    GitStore.create ~root:(local_mirror repo) ()
+
+  let fetch pull_request t =
     (* Fetching upstream is actually unneeded (the remote repo should include
        the commits) -- that is, until we check that the PR is really from a
        parent of the origin's master or signed commit.
@@ -302,6 +307,8 @@ module PrChecks = struct
       u_base = OpamPackage.Set.empty;
       u_test = false;
       u_doc = false;
+      u_dev = OpamPackage.Set.empty;
+      u_attrs = [];
     } in
     Lwt.return (packages, OpamSolver.installable universe)
 
@@ -362,8 +369,8 @@ module PrChecks = struct
     | `Warnings _ as w, _ | _, (`Warnings _ as w) -> w
     | `Passed, `Passed -> `Passed
 
-  let run pr =
-    RepoGit.fetch pr >>= fun gitstore ->
+  let run pr gitstore =
+    RepoGit.fetch pr gitstore >>= fun gitstore ->
     let head = Git.SHA.of_hex pr.head.sha in
     RepoGit.common_ancestor pr gitstore >>= fun ancestor ->
     lint ancestor head gitstore >>= fun (stlint,msglint) ->
@@ -592,31 +599,32 @@ let () =
       exit 3
   in
   let pr_stream, pr_push = Lwt_stream.create () in
-  let rec check_loop () =
+  let rec check_loop gitstore =
     (* The checks are done sequentially *)
-    Lwt.try_bind
-      (fun () ->
-         Lwt_stream.next pr_stream >>= fun pr ->
-         log "=> PR #%d received \
-              (onto %s/%s#%s from %s/%s#%s, commit %s over %s)"
-           pr.number
-           pr.base.repo.user pr.base.repo.name pr.base.ref
-           pr.head.repo.user pr.head.repo.name pr.head.ref
-           pr.head.sha pr.base.sha;
-         PrChecks.run pr >>= fun report ->
-         Github_comment.push_report
-           ~name:conf.Conf.name
-           ~token:conf.Conf.token
-           ~report
-           pr)
-      (fun () -> Lwt.return_unit)
-      (fun exn ->
-         log "Check failed: %s" (Printexc.to_string exn);
-         Lwt.return_unit)
-    >>= check_loop
+    Lwt.catch
+       (fun () ->
+          Lwt_stream.next pr_stream >>= fun pr ->
+          log "=> PR #%d received \
+               (onto %s/%s#%s from %s/%s#%s, commit %s over %s)"
+            pr.number
+            pr.base.repo.user pr.base.repo.name pr.base.ref
+            pr.head.repo.user pr.head.repo.name pr.head.ref
+            pr.head.sha pr.base.sha;
+          PrChecks.run pr gitstore >>= fun report ->
+          Github_comment.push_report
+            ~name:conf.Conf.name
+            ~token:conf.Conf.token
+            ~report
+            pr)
+       (function
+         | Lwt_stream.Empty -> exit 0
+         | exn ->
+           log "Check failed: %s" (Printexc.to_string exn);
+           Lwt.return_unit)
+    >>= fun () -> check_loop gitstore
   in
   Lwt_main.run (Lwt.join [
-      check_loop ();
+      RepoGit.get {user="ocaml";name="opam-repository"} >>= check_loop;
       Webhook_handler.server
         ~port:conf.Conf.port
         ~secret:conf.Conf.secret
