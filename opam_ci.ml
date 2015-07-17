@@ -82,7 +82,8 @@ module RepoGit = struct
          log "fetched upstream\n";
        ]}
     *)
-    GitSync.fetch t (github_repo pull_request.head.repo) >>= fun head_fetch ->
+    GitSync.fetch t ~unpack:true (github_repo pull_request.head.repo)
+    >>= fun head_fetch ->
     log "fetched user repo";
     Lwt.return t
 
