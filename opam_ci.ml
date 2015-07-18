@@ -442,37 +442,30 @@ module Github_comment = struct
         Github.API.patch ~expected_code:`OK ~token ~body ~uri
           (fun b -> Lwt.return (Github_j.issue_comment_of_string b))
     in
-    (* requires write access to the repository from the bot
-       {[
-         let push_status () =
-           log "Pushing status...";
-           let status =
-             let new_status_state, new_status_description =
-               match status with
-               | `Passed ->
-                 `Success, Some "All opam-lint tests passed"
-               | `Warnings ps ->
-                 `Success, Some ("Packages with warnings: "^String.concat " " ps)
-               | `Errors ps ->
-                 `Error, Some ("Packages with errors: "^String.concat " " ps)
-             in
-             { Github_t.
-               new_status_state;
-               new_status_target_url = None;
-               new_status_description;
-             }
-           in
-           Github.Status.create
-             ~token ~user:pr.base.repo.user ~repo:pr.base.repo.name
-             ~status ~sha:pr.head.sha ()
-           >>= fun _ ->
-         in
-       ]}
-    *)
+    let push_status () =
+      log "Pushing status...";
+      let status =
+        let new_status_state, new_status_description =
+          match status with
+          | `Passed ->
+            `Success, Some "All tests passed"
+          | `Warnings ps ->
+            `Success, Some ("Warnings for "^String.concat ", " ps)
+          | `Errors ps ->
+            `Error, Some ("Errors for "^String.concat ", " ps)
+        in
+        { new_status_state;
+          new_status_target_url = None;
+          new_status_description; }
+      in
+      Github.Status.create
+        ~token ~user:pr.base.repo.user ~repo:pr.base.repo.name
+        ~status ~sha:pr.head.sha ()
+    in
     run (
       comment () >>= fun _ ->
-      (* push_status () >>= fun _ -> *)
-      return (log "Posted back to PR #%d." pr.number)
+      push_status () >>= fun _ ->
+      return (log "Comment posted back to PR #%d" pr.number);
     )
 
 end
