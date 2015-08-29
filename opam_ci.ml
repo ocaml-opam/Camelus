@@ -215,6 +215,8 @@ module PrChecks = struct
 
   let pkg_to_string p = Printf.sprintf "`%s`" (OpamPackage.to_string p)
 
+  let max_items_in_post = 50
+
   let lint ancestor head gitstore =
     RepoGit.changed_files ancestor head gitstore >|= fun files ->
     let opam_files =
@@ -273,29 +275,40 @@ module PrChecks = struct
         pkgname passed
     in
     let warns =
-      OpamStd.List.concat_map "\n\n"
-        (fun ((_, warns, _) as fe) ->
-           Printf.sprintf "* **%s** has some warnings:\n\n%s\n"
-             (pkgname fe)
-             (OpamStd.Format.itemize ~bullet:"  * "
-                (fun (num,_,msg) -> Printf.sprintf "**warning %d**: %s" num msg)
-                warns))
+      if List.length warnings + List.length errors > max_items_in_post then
+        OpamStd.List.concat_map
+          ~left:"* **Packages with warnings**: " ~right:"\n" ", "
+          pkgname warnings
+      else
+        OpamStd.List.concat_map "\n\n"
+          (fun ((_, warns, _) as fe) ->
+             Printf.sprintf "* **%s** has some warnings:\n\n%s\n"
+               (pkgname fe)
+               (OpamStd.Format.itemize ~bullet:"  * "
+                  (fun (num,_,msg) ->
+                     Printf.sprintf "**warning %d**: %s" num msg)
+                  warns))
         warnings
     in
     let errs =
-      OpamStd.List.concat_map "\n\n"
-        (fun ((_, we, _) as fe) ->
-           Printf.sprintf "* **%s** has errors:\n\n%s\n"
-             (pkgname fe)
-             (OpamStd.Format.itemize ~bullet:"  * "
-                (fun (num,kind,msg) ->
-                   let kind = match kind with
-                     | `Warning -> "warning"
-                     | `Error -> "error"
-                   in
-                   Printf.sprintf "**%s %d:** %s" kind num msg)
-                we))
-        errors
+      if List.length errors > max_items_in_post then
+        OpamStd.List.concat_map
+          ~left:"* **Packages with errors**: " ~right:"\n" ", "
+          pkgname errors
+      else
+        OpamStd.List.concat_map "\n\n"
+          (fun ((_, we, _) as fe) ->
+             Printf.sprintf "* **%s** has errors:\n\n%s\n"
+               (pkgname fe)
+               (OpamStd.Format.itemize ~bullet:"  * "
+                  (fun (num,kind,msg) ->
+                     let kind = match kind with
+                       | `Warning -> "warning"
+                       | `Error -> "error"
+                     in
+                     Printf.sprintf "**%s %d:** %s" kind num msg)
+                  we))
+          errors
     in
     let status =
       if errors <> [] then `Errors (List.map pkgname errors)
