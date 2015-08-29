@@ -77,16 +77,11 @@ module RepoGit = struct
     GitStore.create ~root:(local_mirror repo) ()
 
   let fetch pull_request t =
-    (* Fetching upstream is actually unneeded (the remote repo should include
-       the commits) -- that is, until we check that the PR is really from a
-       parent of the origin's master or signed commit.
-       {[
-         GitSync.fetch t upstream_repo >>= fun _ ->
-         log "fetched upstream\n";
-       ]}
-    *)
+    GitSync.fetch t ~unpack:true (github_repo pull_request.base.repo)
+    >>= fun _ ->
+    log "fetched upstream";
     GitSync.fetch t ~unpack:true (github_repo pull_request.head.repo)
-    >>= fun head_fetch ->
+    >>= fun _head_fetch ->
     log "fetched user repo";
     Lwt.return t
 
