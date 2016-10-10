@@ -56,10 +56,10 @@ module RepoGit = struct
     | Some x ->
       let kind = Git.Object_type.to_string (Git.Value.type_of x) in
       Lwt.fail (Failure (Printf.sprintf "Not a commit (%s: %s)"
-                           (Git.SHA.to_hex sha) kind))
+                           (Git.Hash.to_hex sha) kind))
     | None ->
       Lwt.fail (Failure (Printf.sprintf "Commit %s not found"
-                           (Git.SHA.to_hex sha)))
+                           (Git.Hash.to_hex sha)))
 
   let get_tree t sha =
     GitStore.read_exn t sha >>= function
@@ -67,11 +67,11 @@ module RepoGit = struct
     | x ->
       let kind = Git.Object_type.to_string (Git.Value.type_of x) in
       Lwt.fail (Failure (Printf.sprintf "Not a tree (%s: %s)"
-                           (Git.SHA.to_hex sha) kind))
+                           (Git.Hash.to_hex sha) kind))
 
   let tree_of_commit_sha t sha =
     get_commit t sha >>= fun c ->
-    get_tree t (Git.SHA.of_tree c.Git.Commit.tree)
+    get_tree t (Git.Hash.of_tree c.Git.Commit.tree)
 
   let get repo =
     GitStore.create ~root:(local_mirror repo) ()
@@ -88,13 +88,13 @@ module RepoGit = struct
   let common_ancestor pull_request t =
     log "Looking up common ancestor...";
     let seen = Hashtbl.create 137 in
-    let module S = Git.SHA.Set in
+    let module S = Git.Hash.Set in
     let (++), (--), (%%) = S.union, S.diff, S.inter in
     let all_parents s =
       Lwt_list.fold_left_s (fun acc sha ->
           try Lwt.return (acc ++ Hashtbl.find seen sha) with Not_found ->
             get_commit t sha >|= fun c ->
-            let p = S.of_list Git.(List.map SHA.of_commit c.Commit.parents) in
+            let p = S.of_list Git.(List.map Hash.of_commit c.Commit.parents) in
             Hashtbl.add seen sha p;
             acc ++ p)
         S.empty (S.elements s)
@@ -122,8 +122,8 @@ module RepoGit = struct
       all_common descendents' current'
         (descendents ++ current) (current -- descendents)
     in
-    let base = S.singleton (Git.SHA.of_hex pull_request.base.sha) in
-    let head = S.singleton (Git.SHA.of_hex pull_request.head.sha) in
+    let base = S.singleton (Git_unix.Hash_IO.of_hex pull_request.base.sha) in
+    let head = S.singleton (Git_unix.Hash_IO.of_hex pull_request.head.sha) in
     all_common base base head head >>= fun common ->
     let rec remove_older ancestors = fun s ->
       if S.is_empty s || S.is_empty ancestors ||
@@ -135,7 +135,7 @@ module RepoGit = struct
     in
     remove_older common common >|= fun found ->
     log "found: %s"
-      (OpamStd.List.concat_map " " Git.SHA.to_hex (S.elements found));
+      (OpamStd.List.concat_map " " Git.Hash.to_hex (S.elements found));
     S.choose found
 
   let changed_files base head t =
@@ -259,7 +259,7 @@ module PrChecks = struct
     in
     let title =
       Printf.sprintf "%s <small>%s</small>\n\n"
-        title (Git.SHA.to_hex head)
+        title (Git.Hash.to_hex head)
     in
     let pkgname (f,_,_) =
       OpamStd.Option.Op.(
@@ -319,7 +319,7 @@ module PrChecks = struct
 
   let installable gitstore sha =
     RepoGit.opam_files gitstore sha >>= fun opams ->
-    log "opam files at %s: %d" (Git.SHA.to_hex sha) (List.length opams);
+    log "opam files at %s: %d" (Git.Hash.to_hex sha) (List.length opams);
     let open OpamTypes in
     let m =
       List.fold_left (fun m o ->
@@ -410,7 +410,7 @@ module PrChecks = struct
 
   let run pr gitstore =
     RepoGit.fetch pr gitstore >>= fun gitstore ->
-    let head = Git.SHA.of_hex pr.head.sha in
+    let head = Git_unix.Hash_IO.of_hex pr.head.sha in
     RepoGit.common_ancestor pr gitstore >>= fun ancestor ->
     lint ancestor head gitstore >>= fun (stlint,msglint) ->
     Lwt.catch (fun () ->
@@ -444,14 +444,11 @@ module Github_comment = struct
       >>= function
       | None ->
         Github.Issue.create_comment ~token ~user ~repo ~num ~body ()
-      | Some c -> (* not in ocaml-github API yet *)
+      | Some { issue_comment_id = id; _ } ->
         let body =
           Github_j.string_of_new_issue_comment { new_issue_comment_body = body }
         in
-        let num = Int64.to_int c.issue_comment_id in
-        let uri = Github.URI.issue_comment ~user ~repo ~num in
-        Github.API.patch ~expected_code:`OK ~token ~body ~uri
-          (fun b -> Lwt.return (Github_j.issue_comment_of_string b))
+        Github.Issue.update_comment ~token ~user ~repo ~id ~body ()
     in
     let push_status () =
       log "Pushing status...";
@@ -467,7 +464,8 @@ module Github_comment = struct
         in
         { new_status_state;
           new_status_target_url = None;
-          new_status_description; }
+          new_status_description;
+          new_status_context = None; }
       in
       Github.Status.create
         ~token ~user:pr.base.repo.user ~repo:pr.base.repo.name

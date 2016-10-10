@@ -5,7 +5,14 @@ based on cohttp (and lwt) for the server part, ocaml-git for checking out the
 states corresponding to the pull-request, opam-lib (and dose) for linting and
 checking installable packages, and ocaml-github to post back the reports.
 
-Dependencies: `cohttp`, `conduit`, `opam-lib`, `git`, `yojson`, `github`.
+Dependencies: `cohttp`, `conduit`, `opam-lib`, `git`, `yojson`, `github`. The
+current version has been tested with:
+- camlzip 1.06
+- git 1.9.1
+- github 2.0.3
+- lwt 2.5.2
+- nocrypto 0.5.3
+- opam-lib pinned to the 1.3 branch at dc3f801a
 
 The program expects a `opam-ci.conf` in the working directory, with the
 following format:
