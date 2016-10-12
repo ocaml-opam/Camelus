@@ -445,9 +445,6 @@ module Github_comment = struct
       | None ->
         Github.Issue.create_comment ~token ~user ~repo ~num ~body ()
       | Some { issue_comment_id = id; _ } ->
-        let body =
-          Github_j.string_of_new_issue_comment { new_issue_comment_body = body }
-        in
         Github.Issue.update_comment ~token ~user ~repo ~id ~body ()
     in
     let push_status () =
