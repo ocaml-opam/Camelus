@@ -182,13 +182,10 @@ module RepoGit = struct
       | None | Some (Git.Value.Commit _) | Some (Git.Value.Tag _) ->
         Lwt.return acc
       | Some (Git.Value.Tree dir) ->
-        let rec find_in_dir dir acc = match dir with
-          | [] -> Lwt.return acc
-          | entry::dir ->
-            find_opams acc (entry.Git.Tree.name :: path) entry.Git.Tree.node
-            >>= find_in_dir dir
-        in
-        find_in_dir dir acc
+        Lwt_list.fold_left_s
+          (fun acc entry ->
+             find_opams acc (entry.Git.Tree.name :: path) entry.Git.Tree.node)
+          acc dir
       | Some (Git.Value.Blob b) ->
         match path with
         | "opam"::_ ->
@@ -418,7 +415,8 @@ module PrChecks = struct
       Lwt.return (add_status stlint stinst,
                   msglint ^ "\n\n---\n" ^ msginst))
       (fun e ->
-        log "Installability check failed: %s" (Printexc.to_string e);
+        log "Installability check failed: %s%s" (Printexc.to_string e)
+          (Printexc.get_backtrace ());
         Lwt.return (stlint, msglint))
 
 end
