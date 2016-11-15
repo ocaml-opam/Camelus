@@ -346,7 +346,9 @@ module PrChecks = struct
       u_dev = OpamPackage.Set.empty;
       u_attrs = [];
     } in
-    Lwt.return (packages, OpamSolver.installable universe)
+    let installable = OpamSolver.installable universe in
+    log "... of which %d installable" (OpamPackage.Set.cardinal installable);
+    Lwt.return (packages, installable)
 
   let installability_check ancestor head gitstore =
     installable gitstore ancestor
