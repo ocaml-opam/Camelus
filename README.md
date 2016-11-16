@@ -12,7 +12,7 @@ current version has been tested with:
 - github 2.0.3
 - lwt 2.5.2
 - nocrypto 0.5.3
-- opam-lib pinned to the 1.3 branch at dc3f801a
+- opam-lib pinned to the 1.3 branch at 833e5b22
 
 The program expects a `opam-ci.conf` in the working directory, with the
 following format:
