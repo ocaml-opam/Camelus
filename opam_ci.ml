@@ -428,18 +428,19 @@ module Github_comment = struct
   open Github.Monad
   open Github_t
 
-  let push_pending_status ~name ~token pr =
+  let make_status ~name ~token pr ?text status =
     let status = {
-      new_status_state = `Pending;
+      new_status_state = status;
       new_status_target_url = None;
-      new_status_description = Some "in progress";
+      new_status_description = text;
       new_status_context = Some name;
     } in
-    run (
-      Github.Status.create
-        ~token ~user:pr.base.repo.user ~repo:pr.base.repo.name
-        ~status ~sha:pr.head.sha ()
-    )
+    Github.Status.create
+      ~token ~user:pr.base.repo.user ~repo:pr.base.repo.name
+      ~status ~sha:pr.head.sha ()
+
+  let push_status ~name ~token pr ?text status =
+    run (make_status ~name ~token pr ?text status)
 
   let push_report ~name ~token ~report:(status,body) pr =
     let user = pr.base.repo.user in
@@ -463,24 +464,15 @@ module Github_comment = struct
     in
     let push_status () =
       log "Pushing status...";
-      let status =
-        let new_status_state, new_status_description =
-          match status with
-          | `Passed ->
-            `Success, Some "All tests passed"
-          | `Warnings ps ->
-            `Success, Some ("Warnings for "^String.concat ", " ps)
-          | `Errors ps ->
-            `Error, Some ("Errors for "^String.concat ", " ps)
-        in
-        { new_status_state;
-          new_status_target_url = None;
-          new_status_description;
-          new_status_context = Some name; }
+      let state, text = match status with
+        | `Passed ->
+          `Success, "All tests passed"
+        | `Warnings ps ->
+          `Success, "Warnings for "^String.concat ", " ps
+        | `Errors ps ->
+          `Error, "Errors for "^String.concat ", " ps
       in
-      Github.Status.create
-        ~token ~user:pr.base.repo.user ~repo:pr.base.repo.name
-        ~status ~sha:pr.head.sha ()
+      make_status ~name ~token pr ~text state
     in
     run (
       comment () >>= fun _ ->
@@ -668,22 +660,30 @@ let () =
             pr.base.repo.user pr.base.repo.name pr.base.ref
             pr.head.repo.user pr.head.repo.name pr.head.ref
             pr.head.sha pr.base.sha;
-          PrChecks.run pr gitstore >>= fun report ->
-          Github_comment.push_report
-            ~name:conf.Conf.name
-            ~token:conf.Conf.token
-            ~report
-            pr)
+          Lwt.catch (fun () ->
+              PrChecks.run pr gitstore >>= fun report ->
+              Github_comment.push_report
+                ~name:conf.Conf.name
+                ~token:conf.Conf.token
+                ~report
+                pr)
+            (fun exn ->
+               log "Check failed: %s" (Printexc.to_string exn);
+               Github_comment.push_status
+                 ~name:conf.Conf.name ~token:conf.Conf.token pr
+                 ~text:"Could not complete" `Failure
+               >>= fun _ -> Lwt.return_unit))
        (function
          | Lwt_stream.Empty -> exit 0
          | exn ->
-           log "Check failed: %s" (Printexc.to_string exn);
+           log "PR handler failed: %s" (Printexc.to_string exn);
            Lwt.return_unit)
     >>= fun () -> check_loop gitstore
   in
   let handler pr =
-    Github_comment.push_pending_status
+    Github_comment.push_status
       ~name:conf.Conf.name ~token:conf.Conf.token pr
+      ~text:"In progress" `Pending
     >>= fun _ -> Lwt.return (pr_push (Some pr))
   in
   Lwt_main.run (Lwt.join [
