@@ -425,9 +425,23 @@ end
 
 module Github_comment = struct
 
+  open Github.Monad
+  open Github_t
+
+  let push_pending_status ~name ~token pr =
+    let status = {
+      new_status_state = `Pending;
+      new_status_target_url = None;
+      new_status_description = Some "in progress";
+      new_status_context = Some name;
+    } in
+    run (
+      Github.Status.create
+        ~token ~user:pr.base.repo.user ~repo:pr.base.repo.name
+        ~status ~sha:pr.head.sha ()
+    )
+
   let push_report ~name ~token ~report:(status,body) pr =
-    let open Github.Monad in
-    let open Github_t in
     let user = pr.base.repo.user in
     let repo = pr.base.repo.name in
     let num = pr.number in
@@ -462,7 +476,7 @@ module Github_comment = struct
         { new_status_state;
           new_status_target_url = None;
           new_status_description;
-          new_status_context = None; }
+          new_status_context = Some name; }
       in
       Github.Status.create
         ~token ~user:pr.base.repo.user ~repo:pr.base.repo.name
@@ -654,10 +668,15 @@ let () =
            Lwt.return_unit)
     >>= fun () -> check_loop gitstore
   in
+  let handler pr =
+    Github_comment.push_pending_status
+      ~name:conf.Conf.name ~token:conf.Conf.token pr
+    >>= fun _ -> Lwt.return (pr_push (Some pr))
+  in
   Lwt_main.run (Lwt.join [
       RepoGit.get {user="ocaml";name="opam-repository"} >>= check_loop;
       Webhook_handler.server
         ~port:conf.Conf.port
         ~secret:conf.Conf.secret
-        ~handler:(fun pr -> Lwt.return (pr_push (Some pr)));
+        ~handler;
     ])
