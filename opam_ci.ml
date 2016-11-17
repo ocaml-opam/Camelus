@@ -604,24 +604,37 @@ module Conf = struct
   module C = struct
     let internal = ".opam-ci"
 
-    type t = { port: int; name: string; token: Github.Token.t; secret: Cstruct.t }
+    type t = {
+      port: int;
+      name: string;
+      token: Github.Token.t;
+      secret: Cstruct.t;
+      repo: repo;
+    }
 
-    let empty = {
+    let default = {
       port = 8122;
       name = "opam-ci";
       token = Github.Token.of_string "";
       secret = Cstruct.of_string "";
+      repo = { user="ocaml"; name="opam-repository"; };
     }
+
+    let empty = default
 
     open OpamFormat
 
     let of_syntax s =
       let f = s.OpamTypes.file_contents in
       {
-        port = assoc_default 8122 f "port" parse_int;
-        name = assoc_default "opam-ci" f "name" parse_string;
+        port = assoc_default default.port f "port" parse_int;
+        name = assoc_default default.name f "name" parse_string;
         token = Github.Token.of_string (assoc f "token" parse_string);
         secret = Cstruct.of_string (assoc f "secret" parse_string);
+        repo = {
+          user = assoc_default default.repo.user f "repo-user" parse_string;
+          name = assoc_default default.repo.name f "repo-name" parse_string;
+        }
       }
 
     let of_channel filename ic =
@@ -674,7 +687,7 @@ let () =
     >>= fun _ -> Lwt.return (pr_push (Some pr))
   in
   Lwt_main.run (Lwt.join [
-      RepoGit.get {user="ocaml";name="opam-repository"} >>= check_loop;
+      RepoGit.get conf.Conf.repo >>= check_loop;
       Webhook_handler.server
         ~port:conf.Conf.port
         ~secret:conf.Conf.secret

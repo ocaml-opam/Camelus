@@ -22,12 +22,15 @@ name: "opam-ci"
 port: 8122
 token: "xxx"
 secret: "yyy"
+repo-user: "ocaml"
+repo-name: "opam"
 ```
 
 The name and token correspond to the GitHub account and token to use (only
-public repository access is needed). The port and secret should correspond to
-the webhook configuration, and the service is at `/opam-ci`, so your
-configuration should look like:
+public repository access is needed); `repo-user:` and `repo-name:` define the
+repository the service will be running on (here "ocaml/opam"). The port and
+secret should correspond to the webhook configuration, and the service is at
+`/opam-ci`, so your configuration in Github should look like:
 - http://opam.ocaml.org:8122/opam-ci
 - `secret` must be identical, it's used to authenticate requests coming from
   your repository on GitHub
