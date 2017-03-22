@@ -190,7 +190,8 @@ module RepoGit = struct
         match path with
         | "opam"::_ ->
           let filename =
-            OpamFilename.of_string (String.concat "/" (List.rev path))
+            OpamFile.make
+              (OpamFilename.of_string (String.concat "/" (List.rev path)))
           in
           let opam =
             try Some (OpamFile.OPAM.read_from_string ~filename
@@ -225,7 +226,9 @@ module PrChecks = struct
     let lint =
       List.map (fun (file,contents) ->
           let r, opamopt =
-            OpamFile.OPAM.validate_string (OpamFilename.of_string file) contents
+            OpamFileTools.lint_string
+              (OpamFile.make (OpamFilename.of_string file))
+              contents
           in
           file, r, opamopt)
         opam_files
@@ -341,8 +344,8 @@ module PrChecks = struct
       u_installed_roots = OpamPackage.Set.empty;
       u_pinned = OpamPackage.Set.empty;
       u_base = OpamPackage.Set.empty;
-      u_test = false;
-      u_doc = false;
+      u_test = OpamPackage.Set.empty;
+      u_doc = OpamPackage.Set.empty;
       u_dev = OpamPackage.Set.empty;
       u_attrs = [];
     } in
@@ -612,7 +615,7 @@ module Conf = struct
       repo: repo;
     }
 
-    let default = {
+    let empty = {
       port = 8122;
       name = "opam-ci";
       token = Github.Token.of_string "";
@@ -620,38 +623,43 @@ module Conf = struct
       repo = { user="ocaml"; name="opam-repository"; };
     }
 
-    let empty = default
+    open OpamPp.Op
 
-    open OpamFormat
+    let fields = [
+      "port", OpamPp.ppacc (fun port t -> {t with port}) (fun t -> t.port)
+        OpamFormat.V.pos_int;
+      "name", OpamPp.ppacc (fun name t -> {t with name}) (fun t -> t.name)
+        OpamFormat.V.string;
+      "token", OpamPp.ppacc (fun token t -> {t with token}) (fun t -> t.token)
+        (OpamFormat.V.string -|
+         OpamPp.of_module "token" (module Github.Token));
+      "secret", OpamPp.ppacc
+        (fun secret t -> {t with secret}) (fun t -> t.secret)
+        (OpamFormat.V.string -|
+         OpamPp.of_pair "secret" Cstruct.(of_string ?allocator:None, to_string));
+      "repo-user", OpamPp.ppacc
+        (fun user t -> {t with repo = {t.repo with user}})
+        (fun t -> t.repo.user)
+        OpamFormat.V.string;
+      "repo-name", OpamPp.ppacc
+        (fun name t -> {t with repo = {t.repo with name}})
+        (fun t -> t.repo.name)
+        OpamFormat.V.string;
+    ]
 
-    let of_syntax s =
-      let f = s.OpamTypes.file_contents in
-      {
-        port = assoc_default default.port f "port" parse_int;
-        name = assoc_default default.name f "name" parse_string;
-        token = Github.Token.of_string (assoc f "token" parse_string);
-        secret = Cstruct.of_string (assoc f "secret" parse_string);
-        repo = {
-          user = assoc_default default.repo.user f "repo-user" parse_string;
-          name = assoc_default default.repo.name f "repo-name" parse_string;
-        }
-      }
-
-    let of_channel filename ic =
-      of_syntax (OpamFile.Syntax.of_channel filename ic)
-
-    let of_string filename str =
-      of_syntax (OpamFile.Syntax.of_string filename str)
-
-    let to_string _ _ = assert false
+    let pp =
+      OpamFormat.I.map_file @@
+      OpamFormat.I.fields ~name:internal ~empty fields -|
+      OpamFormat.I.show_errors ~name:internal ~strict:true ()
   end
   include C
-  include OpamFile.Make(C)
+  include OpamFile.SyntaxFile(C)
 end
 
 let () =
   let conf =
-    try Conf.read (OpamFilename.of_string "opam-ci.conf") with _ ->
+    let f = OpamFile.make (OpamFilename.of_string "opam-ci.conf") in
+    try Conf.read f with _ ->
       prerr_endline "A file opam-ci.conf with fields `token' and `secret' (and \
                      optionally `name' and `port') is required.";
       exit 3
