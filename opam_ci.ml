@@ -428,6 +428,8 @@ module Github_comment = struct
   open Github.Monad
   open Github_t
 
+  let github_max_descr_length = 140
+
   let make_status ~name ~token pr ?text status =
     let status = {
       new_status_state = status;
@@ -468,9 +470,15 @@ module Github_comment = struct
         | `Passed ->
           `Success, "All tests passed"
         | `Warnings ps ->
-          `Success, "Warnings for "^String.concat ", " ps
+          `Success,
+          let m = "Warnings for "^String.concat ", " ps in
+          if String.length m <= github_max_descr_length then m else
+            Printf.sprintf "Warnings for %d packages" (List.length ps)
         | `Errors ps ->
-          `Error, "Errors for "^String.concat ", " ps
+          `Error,
+          let m = "Errors for "^String.concat ", " ps in
+          if String.length m <= github_max_descr_length then m else
+            Printf.sprintf "Errors for %d packages" (List.length ps)
       in
       make_status ~name ~token pr ~text state
     in
