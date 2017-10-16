@@ -1,0 +1,10 @@
+B .
+FLG -w -40
+PKG lwt
+PKG git
+PKG git-unix
+PKG github-unix
+PKG opam-core
+PKG opam-format
+PKG opam-solver
+PKG opam-state

@@ -333,21 +333,46 @@ module PrChecks = struct
     let packages =
       OpamPackage.Set.of_list (OpamPackage.Map.keys m)
     in
+    let env nv v =
+      match OpamVariable.Full.scope v,
+            OpamVariable.(to_string (Full.variable v))
+      with
+      | (OpamVariable.Full.Global | OpamVariable.Full.Self), "name" ->
+        Some (S (OpamPackage.Name.to_string nv.name))
+      | (OpamVariable.Full.Global | OpamVariable.Full.Self), "version" ->
+        Some (S (OpamPackage.Version.to_string nv.version))
+      | OpamVariable.Full.Global, "opam-version" ->
+        Some (S OpamVersion.(to_string current))
+      | _ -> None
+    in
     let universe = {
       u_packages = packages;
-      u_action = Depends;
+      u_action = Query;
       u_installed = OpamPackage.Set.empty;
       u_available = packages; (* Todo: check for different constraints *)
-      u_depends = OpamPackage.Map.map OpamFile.OPAM.depends m;
-      u_depopts = OpamPackage.Map.map OpamFile.OPAM.depopts m;
-      u_conflicts = OpamPackage.Map.map OpamFile.OPAM.conflicts m;
+      u_depends =
+        OpamPackage.Map.mapi
+          (fun nv o ->
+             OpamFile.OPAM.depends o |>
+             OpamFilter.partial_filter_formula (env nv))
+          m;
+      u_depopts =
+        OpamPackage.Map.mapi
+          (fun nv o ->
+             OpamFile.OPAM.depopts o |>
+             OpamFilter.partial_filter_formula (env nv))
+          m;
+      u_conflicts =
+        OpamPackage.Map.mapi
+          (fun nv o ->
+             OpamFile.OPAM.conflicts o |>
+             OpamFilter.filter_formula ~default:false (env nv))
+          m;
       u_installed_roots = OpamPackage.Set.empty;
       u_pinned = OpamPackage.Set.empty;
       u_base = OpamPackage.Set.empty;
-      u_test = OpamPackage.Set.empty;
-      u_doc = OpamPackage.Set.empty;
-      u_dev = OpamPackage.Set.empty;
       u_attrs = [];
+      u_reinstall = OpamPackage.Set.empty;
     } in
     let installable = OpamSolver.installable universe in
     log "... of which %d installable" (OpamPackage.Set.cardinal installable);
