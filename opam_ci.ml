@@ -35,6 +35,14 @@ type pull_request = {
   number: int;
   base: full_ref;
   head: full_ref;
+  pr_user: string;
+  message: string * string;
+}
+
+type push_event = {
+  push_repo: repo;
+  push_head: string;
+  push_ancestor: string;
 }
 
 module RepoGit = struct
@@ -76,14 +84,56 @@ module RepoGit = struct
   let get repo =
     GitStore.create ~root:(local_mirror repo) ()
 
-  let fetch pull_request t =
-    GitSync.fetch t ~unpack:true (github_repo pull_request.base.repo)
-    >>= fun _ ->
+  let get_file t sha path =
+    let rec follow_path path sha = match path with
+      | [] -> (GitStore.read t sha >>= function
+          | Some (Git.Value.Blob b) -> Lwt.return (Some (Git.Blob.to_raw b))
+          | _ -> Lwt.return None)
+      | dir :: path -> (GitStore.read t sha >>= function
+          | Some (Git.Value.Tree tr) ->
+            let en_opt =
+              OpamStd.Option.of_Not_found
+                (List.find (fun en -> en.Git.Tree.name = dir)) tr
+            in
+            (match en_opt with
+             | Some en -> follow_path path en.Git.Tree.node
+             | None -> Lwt.return None)
+          | _ -> Lwt.return None)
+    in
+    get_commit t sha >>= fun c ->
+    follow_path (OpamStd.String.split path '/')
+      (Git.Hash.of_tree c.Git.Commit.tree)
+
+  let get_file_exn t sha path =
+    get_file t sha path >>= function
+    | Some f -> Lwt.return f
+    | None -> Lwt.fail Not_found
+
+  let branch_reference name =
+    Git.Reference.of_raw ("refs/heads/" ^ name)
+
+  let get_branch t name =
+    GitStore.read_reference_exn t (branch_reference name)
+
+  let set_branch t name commit_hash =
+    GitStore.write_reference t (branch_reference name) commit_hash
+
+  let fetch t repo =
+    GitSync.fetch t ~unpack:true (github_repo repo)
+
+  let fetch_pr pull_request t =
+    fetch t pull_request.base.repo >>= fun _ ->
     log "fetched upstream";
-    GitSync.fetch t ~unpack:true (github_repo pull_request.head.repo)
-    >>= fun _head_fetch ->
+    fetch t pull_request.head.repo >>= fun _head_fetch ->
     log "fetched user repo";
-    Lwt.return t
+    Lwt.return_unit
+
+  let push t branch repo =
+    GitSync.push t ~branch:(branch_reference branch) (github_repo repo)
+    >|= function
+    | { Git.Sync.Result.result = `Ok; _ } -> ()
+    | { Git.Sync.Result.result = `Error s; _ } ->
+      log "ERROR: could not push to %s: %s" branch s
 
   let common_ancestor pull_request t =
     log "Looking up common ancestor...";
@@ -206,6 +256,276 @@ module RepoGit = struct
     tree_of_commit_sha t sha >>= fun root ->
     List.find (fun tr -> tr.Git.Tree.name = "packages") root |> fun en ->
     find_opams [] ["packages"] en.Git.Tree.node
+
+end
+
+module FormatUpgrade = struct
+
+  let onto_branch = "2.0.0"
+
+  let git_identity () = {
+    Git.User.
+    name = "Camelus";
+    email = "opam-commits@lists.ocaml.org";
+    date = Int64.of_float (Unix.time ()), None;
+  }
+
+  let get_updated_opam commit gitstore nv =
+    let opam_dir =
+      Printf.sprintf "/packages/%s/%s/"
+        (OpamPackage.name_to_string nv)
+        (OpamPackage.to_string nv)
+    in
+    let opam_file = opam_dir^"opam" in
+    RepoGit.get_file_exn gitstore commit opam_file >>= fun opam_str ->
+    RepoGit.get_file gitstore commit (opam_dir^"url") >>= fun url_str ->
+    RepoGit.get_file gitstore commit (opam_dir^"descr") >>= fun descr_str ->
+    let opam =
+      OpamFile.OPAM.read_from_string
+        ~filename:(OpamFile.make (OpamFilename.of_string opam_file))
+        opam_str
+    in
+    let opam = match descr_str with
+      | None -> opam
+      | Some d ->
+        OpamFile.OPAM.with_descr (OpamFile.Descr.read_from_string d) opam
+    in
+    let opam = match url_str with
+      | None -> opam
+      | Some u ->
+        OpamFile.OPAM.with_url (OpamFile.URL.read_from_string u) opam
+    in
+    let opam = OpamFormatUpgrade.opam_file ~quiet:true opam in
+    let opam_str =
+      OpamFile.OPAM.to_string_with_preserved_format
+        ~format_from_string:opam_str
+        (OpamFile.make (OpamFilename.of_string opam_file))
+        opam
+    in
+    Lwt.return opam_str
+
+  let get_compiler_opam commit gitstore comp_name =
+    let bname =
+      Printf.sprintf "/compilers/%s/%s/%s"
+        (match OpamStd.String.cut_at comp_name '+'
+         with Some (v,_) -> v | None -> comp_name)
+        comp_name comp_name
+    in
+    let filename = bname^".comp" in
+    RepoGit.get_file_exn gitstore commit filename >>= fun comp_str ->
+    RepoGit.get_file gitstore commit (bname^".descr") >>= fun descr_str ->
+    let comp =
+      OpamFile.Comp.read_from_string
+        ~filename:(OpamFile.make (OpamFilename.of_string filename))
+        comp_str
+    in
+    let descr =
+      OpamStd.Option.map OpamFile.Descr.read_from_string descr_str
+    in
+    let opam = OpamFile.Comp.to_package comp descr in
+    let opam_str = OpamFile.OPAM.write_to_string opam in
+    Lwt.return (OpamFile.OPAM.package opam, opam_str)
+
+  let get_updated_subtree commit gitstore changed_files =
+    let compilers, packages, files =
+      List.fold_left (fun (compilers, packages, files) (f, contents) ->
+          try Scanf.sscanf f "/compilers/%_s@/%s@/"
+                (fun s -> OpamStd.String.Set.add s compilers, packages, files)
+          with Scanf.Scan_failure _ -> try
+              Scanf.sscanf f "/packages/%_s@/%s@/%s@/"
+                (fun s -> function
+                   | "opam" | "url" | "descr" ->
+                     compilers,
+                     OpamPackage.Set.add (OpamPackage.of_string s) packages,
+                     files
+                   | "files" ->
+                     compilers, packages, OpamStd.String.Map.add f contents files
+                   | _ -> compilers, packages, files)
+            with Scanf.Scan_failure _ -> compilers, packages, files)
+        (OpamStd.String.Set.empty,
+         OpamPackage.Set.empty,
+         OpamStd.String.Map.empty)
+        changed_files
+    in
+    Lwt_list.fold_left_s (fun acc comp_name ->
+        get_compiler_opam commit gitstore comp_name >|= fun (nv,opam) ->
+        OpamPackage.Map.add nv opam acc)
+      OpamPackage.Map.empty
+      (OpamStd.String.Set.elements compilers)
+    >>= fun compiler_packages ->
+    Lwt_list.fold_left_s (fun acc nv ->
+        get_updated_opam commit gitstore nv >|= fun opam ->
+        OpamPackage.Map.add nv opam acc)
+      compiler_packages
+      (OpamPackage.Set.elements packages)
+    >|= fun upgraded_packages ->
+    OpamPackage.Map.fold (fun nv opam acc ->
+        let f =
+          Printf.sprintf "/packages/%s/%s/opam"
+            (OpamPackage.name_to_string nv)
+            (OpamPackage.to_string nv)
+        in
+        OpamStd.String.Map.add f opam acc)
+      upgraded_packages
+      files
+
+  let rec add_file_to_tree gitstore tree path contents =
+    match path with
+    | [] -> Lwt.fail (Failure "Empty path")
+    | [file] ->
+      RepoGit.GitStore.write gitstore
+        (Git.Value.blob (Git.Blob.of_raw contents))
+      >>= fun hash ->
+      let entry = { Git.Tree.perm = `Normal; name = file; node = hash } in
+      Lwt.return (entry :: List.filter (fun e -> e.Git.Tree.name <> file) tree)
+    | dir::path ->
+      let subtree =
+        try
+          Some (List.find
+                  (fun e -> e.Git.Tree.name = dir && e.Git.Tree.perm = `Dir)
+                  tree).Git.Tree.node
+        with Not_found -> None
+      in
+      (match subtree with
+       | Some h -> RepoGit.get_tree gitstore h
+       | None -> Lwt.return [])
+      >>= fun subtree ->
+      add_file_to_tree gitstore subtree path contents >>= fun subtree ->
+      RepoGit.GitStore.write gitstore (Git.Value.tree subtree) >>= fun hash ->
+      let entry = { Git.Tree.perm = `Dir; name = dir; node = hash } in
+      Lwt.return (entry :: List.filter (fun e -> e.Git.Tree.name <> dir) tree)
+
+  let gen_upgrade_commit ancestor head onto gitstore author message =
+    RepoGit.changed_files ancestor head gitstore >>= fun files ->
+    get_updated_subtree head gitstore files >>= fun replace_files ->
+    RepoGit.tree_of_commit_sha gitstore onto >>= fun onto_tree ->
+    Lwt_list.fold_left_s (fun tree (path,contents) ->
+        let path = OpamStd.String.split path '/' in
+        add_file_to_tree gitstore tree path contents)
+      onto_tree (OpamStd.String.Map.bindings replace_files)
+    >>= fun new_tree ->
+    RepoGit.GitStore.write gitstore (Git.Value.tree new_tree) >>= fun hash ->
+    let commit =
+      { Git.Commit.
+        tree = Git.Hash.to_tree hash;
+        parents = [Git.Hash.to_commit onto];
+        author = author;
+        committer = git_identity ();
+        message = message;
+      }
+    in
+    RepoGit.GitStore.write gitstore (Git.Value.commit commit)
+
+  let run ancestor_s head_s gitstore repo =
+    let ancestor = Git_unix.Hash_IO.of_hex ancestor_s in
+    let head = Git_unix.Hash_IO.of_hex head_s in
+    RepoGit.fetch gitstore repo >>= fun fetch ->
+    let remote_onto =
+      Git.Reference.Map.find (RepoGit.branch_reference onto_branch)
+        (Git.Sync.Result.references fetch)
+    in
+    RepoGit.set_branch gitstore onto_branch remote_onto >>= fun () ->
+    log "Fetched new commits";
+    Lwt.catch (fun () ->
+        RepoGit.get_branch gitstore onto_branch >>= fun onto_head ->
+        RepoGit.get_commit gitstore head >>= fun head_commit ->
+        let author = head_commit.Git.Commit.author in
+        let message =
+          Printf.sprintf
+            "%s\n\n_translated to 2.0 format by Camelus_\n"
+            head_commit.Git.Commit.message
+        in
+        log "Rewriting commit %s by %s (and possible parents)"
+          head_s head_commit.Git.Commit.author.Git.User.name;
+        gen_upgrade_commit ancestor head onto_head gitstore author message
+        >>= fun commit_hash ->
+        RepoGit.set_branch gitstore onto_branch commit_hash
+        >>= fun () ->
+        log "Pushing new commit %s onto %s"
+          (Git.Hash.to_hex commit_hash) onto_branch;
+        RepoGit.push gitstore onto_branch repo
+        >>= fun () ->
+        log "Upgrade done";
+        Lwt.return_unit
+      )
+      (fun e ->
+         log "Upgrade and push to branch %s failed: %s%s" onto_branch
+           (Printexc.to_string e)
+           (Printexc.get_backtrace ());
+         Lwt.return_unit)
+
+
+(*
+    >>= fun commit_hash ->
+    
+
+    
+    let compilers, packages =
+      List.fold_left (fun (compilers, packages) (f, _) ->
+          try Scanf.sscanf f "/compilers/%_s@/%s@/"
+                (fun s -> OpamStd.String.Set.add s compilers, packages)
+          with Scanf.Scan_failure _ ->
+            Scanf.sscanf f "/packages/%_s@/%s@/"
+              (fun s ->
+                 compilers,
+                 OpamPackage.Set.add (OpamPackage.of_string s) packages))
+        (OpamStd.String.Set.empty, OpamPackage.Set.empty)
+        files
+    in
+    let compiler_packages =
+      Lwt_list.fold_left_s (fun acc comp_name ->
+          get_compiler_opam head gitstore comp_name >|= fun (nv,opam) ->
+          OpamPackage.Map.add nv opam acc)
+        OpamPackage.Map.empty
+        (OpamStd.String.Set.elements compilers)
+    in
+    let modified_packages =
+      compiler_packages >|= fun comps ->
+      OpamPackage.Set.union (OpamPackage.keys comps) packages
+    in
+    let ugraded_packages =
+      Lwt_list.fold_left_s (fun acc nv ->
+          get_updated_opam head gitstore nv >|= fun opam ->
+          OpamPackage.Map.add nv opam acc)
+        OpamPackage.Map.empty
+        (OpamPackage.Set.elements packages)
+    in
+    let new_subtree =
+      (* compiler packages + updated packages + modified package files/ *)
+    let 
+
+          RepoGit.get_file gitstore head comp_file >>= fun comp_str ->
+          RepoGit.get_file gitstore head
+            (Filename.chop_extension comp_file ^ ".descr") >>= fun descr_str ->
+          match comp_str with
+          | Some comp_str ->
+            let comp =
+              OpamFile.Comp.read_from_string
+                ~filename:(OpamFile.make (OpamFilename.of_string comp_file))
+                comp_str
+            in
+            let descr =
+              OpamStd.Option.map OpamFile.Descr.read_from_string descr_str
+            in
+            let opam = OpamFile.Comp.to_package comp descr in
+            Lwt.return
+              (OpamPackage.Map.add (OpamFile.OPAM.package opam) opam acc)
+          | None -> Lwt.return acc)
+        OpamPackage.Map.empty
+        (OpamStd.String.Set.elements packages)
+    in
+    
+      
+            
+      
+    let opam_files =
+      List.filter (fun (s,_) ->
+          OpamStd.String.starts_with ~prefix:"/packages/" s &&
+          OpamStd.String.ends_with ~suffix:"/opam" s)
+        files
+    in
+    
+*)
 
 end
 
@@ -436,7 +756,7 @@ module PrChecks = struct
     | `Passed, `Passed -> `Passed
 
   let run pr gitstore =
-    RepoGit.fetch pr gitstore >>= fun gitstore ->
+    RepoGit.fetch_pr pr gitstore >>= fun () ->
     let head = Git_unix.Hash_IO.of_hex pr.head.sha in
     RepoGit.common_ancestor pr gitstore >>= fun ancestor ->
     lint ancestor head gitstore >>= fun (stlint,msglint) ->
@@ -526,8 +846,6 @@ module Webhook_handler = struct
   let uri_path = "/opam-ci"
   let exp_method = `POST
   let exp_ua_prefix = "GitHub-Hookshot/"
-  let exp_event = "pull_request"
-  let exp_actions = ["opened"; "reopened"; "synchronize"]
 
   (** Check that the request is well-formed and originated from GitHub *)
   let check_github ~secret req body =
@@ -543,24 +861,64 @@ module Webhook_handler = struct
       Header.get headers "x-hub-signature" >>|
       OpamStd.String.remove_prefix ~prefix:"sha1=" >>|
       Nocrypto.Uncommon.Cs.of_hex >>|
-      Cstruct.equal
-        (Nocrypto.Hash.mac `SHA1 ~key:secret (Cstruct.of_string body))
+      Cstruct.equal (Nocrypto.Hash.mac `SHA1 ~key:secret (Cstruct.of_string body))
     ) = Some true
+
+  module JS = struct
+    let (-.-) json key = match json with
+      | `Assoc dic -> List.assoc key dic
+      | _ -> log "field %s not found" key; raise Not_found
+    let to_string = function
+      | `String s -> s
+      | _ -> raise Not_found
+    let to_int = function
+      | `Int i -> i
+      | _ -> raise Not_found
+  end
+
+  let pull_request_of_json json =
+    let open JS in
+    match json -.- "action" |> to_string with
+    | "opened" | "reopened" | "syncronize" ->
+      let number = json -.- "number" |> to_int in
+      let pr = json -.- "pull_request" in
+      let full_repo r = {
+        repo = { user = r -.- "user" -.- "login" |> to_string;
+                 name = r -.- "repo" -.- "name" |> to_string; };
+        ref = r -.- "ref" |> to_string;
+        sha = r -.- "sha" |> to_string;
+      } in
+      let base = full_repo (pr -.- "base") in
+      let head = full_repo (pr -.- "head") in
+      let pr_user = pr -.- "user" -.- "login" |> to_string in
+      let message =
+        pr -.- "title" |> to_string,
+        pr -.- "body" |> to_string
+      in
+      Some { number; base; head; pr_user; message }
+    | a ->
+      log "Ignoring %s PR action" a;
+      None
+
+  let push_event_of_json json =
+    let open JS in
+    let ref = json -.- "ref" |> to_string in
+    let push_head = json -.- "after" |> to_string  in
+    let push_ancestor = json -.- "before" |> to_string in
+    let r = json -.- "repository" in
+    let push_repo = {
+      user = r -.- "owner" -.- "name" |> to_string;
+      name = r -.- "name" |> to_string;
+    } in
+    match ref with
+    | "refs/heads/master" ->
+      Some { push_head; push_ancestor; push_repo }
+    | ref ->
+      log "Ignoring push to %s" ref;
+      None
 
   let server ~port ~secret ~handler =
     let callback (conn, _) req body =
-      let (-.-) json key = match json with
-        | `Assoc dic -> List.assoc key dic
-        | _ -> log "field %s not found" key; raise Not_found
-      in
-      let to_string = function
-        | `String s -> s
-        | _ -> raise Not_found
-      in
-      let to_int = function
-        | `Int i -> i
-        | _ -> raise Not_found
-      in
       Cohttp_lwt_body.to_string body >>= fun body ->
       if not (check_github ~secret req body) then
         (log "Ignored invalid request:\n%s"
@@ -574,54 +932,38 @@ module Webhook_handler = struct
                   "x-hub-signature";  "x-github-event"; ]));
          Server.respond_not_found ())
       else
-      if Header.get (Request.headers req) "x-github-event" <> Some exp_event
-      then
-        (log "Ignored non pull-request action";
-         Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ())
-      else
-      let json =
-        try Some (Yojson.Safe.from_string body) with Failure _ -> None
-      in
-      match json with
-      | None ->
-        log "Error: invalid json :\n%s" body;
+      match Yojson.Safe.from_string body with
+      | exception Failure err ->
+        log "Error: invalid json (%s):\n%s" err body;
         Server.respond_error ~body:"Invalid JSON" ()
-      | Some json ->
-        let action =
-          try Some (json -.- "action" |> to_string)
-          with Not_found -> None
-        in
-        match action with
-        | Some a when List.mem a exp_actions ->
-          let pr =
-            try
-              let number = json -.- "number" |> to_int in
-              let pr = json -.- "pull_request" in
-              let full_repo r = {
-                repo = { user = r -.- "user" -.- "login" |> to_string;
-                         name = r -.- "repo" -.- "name" |> to_string; };
-                ref = r -.- "ref" |> to_string;
-                sha = r -.- "sha" |> to_string;
-              } in
-              let base = full_repo (pr -.- "base") in
-              let head = full_repo (pr -.- "head") in
-              Some { number; base; head }
-            with Not_found -> None
-          in
-          begin match pr with
-            | Some pr ->
-              handler pr >>= fun () ->
-              Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
-            | None ->
-              log "Error: invalid Json structure:\n%s"
-                (Yojson.Safe.to_string json);
-              Server.respond_error ~body:"Invalid format" ()
-          end
-        | Some _ ->
+      | json ->
+        match Header.get (Request.headers req) "x-github-event" with
+        | Some "pull_request" ->
+          (match pull_request_of_json json with
+           | Some pr ->
+             handler (`Pr pr) >>= fun () ->
+             Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
+           | None ->
+             Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
+           | exception Not_found ->
+             log "Error: could not get PR data from JSON:\n%s"
+               (Yojson.Safe.to_string json);
+             Server.respond_error ~body:"Invalid format" ())
+        | Some "push" ->
+          (match push_event_of_json json with
+           | Some push ->
+             handler (`Push push) >>= fun () ->
+             Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
+           | None ->
+             Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
+           | exception Not_found ->
+             log "Error: could not get push event data from JSON:\n%s"
+               (Yojson.Safe.to_string json);
+             Server.respond_error ~body:"Invalid format" ())
+        | Some a ->
+          log "Ignored %s event" a;
           Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
         | None ->
-          log "Error: could not get action from JSON:\n%s"
-            (Yojson.Safe.to_string json);
           Server.respond_error ~body:"Invalid format" ()
     in
     log "Listening on port %d" port;
@@ -638,6 +980,7 @@ module Conf = struct
       token: Github.Token.t;
       secret: Cstruct.t;
       repo: repo;
+      roles: [ `Pr_checker | `Push_upgrader ] list;
     }
 
     let empty = {
@@ -646,6 +989,7 @@ module Conf = struct
       token = Github.Token.of_string "";
       secret = Cstruct.of_string "";
       repo = { user="ocaml"; name="opam-repository"; };
+      roles = [ `Pr_checker ];
     }
 
     open OpamPp.Op
@@ -689,43 +1033,58 @@ let () =
                      optionally `name' and `port') is required.";
       exit 3
   in
-  let pr_stream, pr_push = Lwt_stream.create () in
+  let event_stream, event_push = Lwt_stream.create () in
   let rec check_loop gitstore =
     (* The checks are done sequentially *)
     Lwt.catch
        (fun () ->
-          Lwt_stream.next pr_stream >>= fun pr ->
-          log "=> PR #%d received \
-               (onto %s/%s#%s from %s/%s#%s, commit %s over %s)"
-            pr.number
-            pr.base.repo.user pr.base.repo.name pr.base.ref
-            pr.head.repo.user pr.head.repo.name pr.head.ref
-            pr.head.sha pr.base.sha;
-          Lwt.catch (fun () ->
-              PrChecks.run pr gitstore >>= fun report ->
-              Github_comment.push_report
-                ~name:conf.Conf.name
-                ~token:conf.Conf.token
-                ~report
-                pr)
-            (fun exn ->
-               log "Check failed: %s" (Printexc.to_string exn);
-               Github_comment.push_status
-                 ~name:conf.Conf.name ~token:conf.Conf.token pr
-                 ~text:"Could not complete" `Failure
-               >>= fun _ -> Lwt.return_unit))
+          Lwt_stream.next event_stream >>= function
+          | `Pr pr ->
+            log "=> PR #%d received \
+                 (onto %s/%s#%s from %s/%s#%s, commit %s over %s)"
+              pr.number
+              pr.base.repo.user pr.base.repo.name pr.base.ref
+              pr.head.repo.user pr.head.repo.name pr.head.ref
+              pr.head.sha pr.base.sha;
+            Lwt.catch (fun () ->
+                PrChecks.run pr gitstore >>= fun report ->
+                Github_comment.push_report
+                  ~name:conf.Conf.name
+                  ~token:conf.Conf.token
+                  ~report
+                  pr)
+              (fun exn ->
+                 log "Check failed: %s" (Printexc.to_string exn);
+                 Github_comment.push_status
+                   ~name:conf.Conf.name ~token:conf.Conf.token pr
+                   ~text:"Could not complete" `Failure
+                 >>= fun _ -> Lwt.return_unit)
+          | `Push p ->
+            log "=> Push received (head %s onto %s)"
+              p.push_head p.push_ancestor;
+            Lwt.catch (fun () ->
+                FormatUpgrade.run
+                  p.push_ancestor p.push_head gitstore p.push_repo)
+              (fun exn ->
+                 log "Upgrade commit failed: %s" (Printexc.to_string exn);
+                 Lwt.return_unit))
        (function
          | Lwt_stream.Empty -> exit 0
          | exn ->
-           log "PR handler failed: %s" (Printexc.to_string exn);
+           log "Event handler failed: %s" (Printexc.to_string exn);
            Lwt.return_unit)
     >>= fun () -> check_loop gitstore
   in
-  let handler pr =
-    Github_comment.push_status
-      ~name:conf.Conf.name ~token:conf.Conf.token pr
-      ~text:"In progress" `Pending
-    >>= fun _ -> Lwt.return (pr_push (Some pr))
+  let handler event =
+    (match event with
+     | `Pr pr ->
+       Github_comment.push_status
+         ~name:conf.Conf.name ~token:conf.Conf.token pr
+         ~text:"In progress" `Pending >>= fun _ ->
+       Lwt.return_unit
+     | _ ->
+       Lwt.return_unit)
+    >>= fun () -> Lwt.return (event_push (Some event))
   in
   Lwt_main.run (Lwt.join [
       RepoGit.get conf.Conf.repo >>= check_loop;
