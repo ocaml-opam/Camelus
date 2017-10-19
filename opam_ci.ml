@@ -23,6 +23,7 @@ let log fmt = OpamConsole.msg (fmt ^^ "\n%!")
 type repo = {
   user: string;
   name: string;
+  auth: (string * string) option; (* user, token *)
 }
 
 type full_ref = {
@@ -53,7 +54,11 @@ module RepoGit = struct
 
   let github_repo repo =
     Git.Gri.of_string
-      (Printf.sprintf "git://github.com/%s/%s" repo.user repo.name)
+      (Printf.sprintf "https://%sgithub.com/%s/%s.git"
+         (match repo.auth with
+          | None -> ""
+          | Some (user, token) -> Printf.sprintf "%s:%s@" user token)
+         repo.user repo.name)
 
   let local_mirror repo =
     Printf.sprintf "./%s%%%s.git" repo.user repo.name
@@ -435,7 +440,7 @@ module FormatUpgrade = struct
             "%s\n\n_translated to 2.0 format by Camelus_\n"
             head_commit.Git.Commit.message
         in
-        log "Rewriting commit %s by %s (and possible parents)"
+        log "Rewriting commit %s (and possible parents) by %s"
           head_s head_commit.Git.Commit.author.Git.User.name;
         gen_upgrade_commit ancestor head onto_head gitstore author message
         >>= fun commit_hash ->
@@ -449,7 +454,7 @@ module FormatUpgrade = struct
         Lwt.return_unit
       )
       (fun e ->
-         log "Upgrade and push to branch %s failed: %s%s" onto_branch
+         log "Upgrade and push to branch %s failed: %s\n%s" onto_branch
            (Printexc.to_string e)
            (Printexc.get_backtrace ());
          Lwt.return_unit)
@@ -884,7 +889,8 @@ module Webhook_handler = struct
       let pr = json -.- "pull_request" in
       let full_repo r = {
         repo = { user = r -.- "user" -.- "login" |> to_string;
-                 name = r -.- "repo" -.- "name" |> to_string; };
+                 name = r -.- "repo" -.- "name" |> to_string;
+                 auth = None; };
         ref = r -.- "ref" |> to_string;
         sha = r -.- "sha" |> to_string;
       } in
@@ -909,6 +915,7 @@ module Webhook_handler = struct
     let push_repo = {
       user = r -.- "owner" -.- "name" |> to_string;
       name = r -.- "name" |> to_string;
+      auth = None;
     } in
     match ref with
     | "refs/heads/master" ->
@@ -988,7 +995,7 @@ module Conf = struct
       name = "opam-ci";
       token = Github.Token.of_string "";
       secret = Cstruct.of_string "";
-      repo = { user="ocaml"; name="opam-repository"; };
+      repo = { user="ocaml"; name="opam-repository"; auth=None };
       roles = [ `Pr_checker ];
     }
 
@@ -1033,6 +1040,7 @@ let () =
                      optionally `name' and `port') is required.";
       exit 3
   in
+  let auth = conf.Conf.name, Github.Token.to_string conf.Conf.token in
   let event_stream, event_push = Lwt_stream.create () in
   let rec check_loop gitstore =
     (* The checks are done sequentially *)
@@ -1064,7 +1072,8 @@ let () =
               p.push_head p.push_ancestor;
             Lwt.catch (fun () ->
                 FormatUpgrade.run
-                  p.push_ancestor p.push_head gitstore p.push_repo)
+                  p.push_ancestor p.push_head gitstore
+                  { p.push_repo with auth = Some auth })
               (fun exn ->
                  log "Upgrade commit failed: %s" (Printexc.to_string exn);
                  Lwt.return_unit))
