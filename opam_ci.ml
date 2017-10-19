@@ -64,7 +64,7 @@ module RepoGit = struct
     Printf.sprintf "./%s%%%s.git" repo.user repo.name
 
   let get_commit t sha =
-    GitStore.read t sha >>= function
+    match%lwt GitStore.read t sha with
     | Some (Git.Value.Commit c) -> Lwt.return c
     | Some x ->
       let kind = Git.Object_type.to_string (Git.Value.type_of x) in
@@ -75,7 +75,7 @@ module RepoGit = struct
                            (Git.Hash.to_hex sha)))
 
   let get_tree t sha =
-    GitStore.read_exn t sha >>= function
+    match%lwt GitStore.read_exn t sha with
     | Git.Value.Tree t -> Lwt.return t
     | x ->
       let kind = Git.Object_type.to_string (Git.Value.type_of x) in
@@ -83,7 +83,7 @@ module RepoGit = struct
                            (Git.Hash.to_hex sha) kind))
 
   let tree_of_commit_sha t sha =
-    get_commit t sha >>= fun c ->
+    let%lwt c = get_commit t sha in
     get_tree t (Git.Hash.of_tree c.Git.Commit.tree)
 
   let get repo =
@@ -91,10 +91,10 @@ module RepoGit = struct
 
   let get_file t sha path =
     let rec follow_path path sha = match path with
-      | [] -> (GitStore.read t sha >>= function
+      | [] -> (match%lwt GitStore.read t sha with
           | Some (Git.Value.Blob b) -> Lwt.return (Some (Git.Blob.to_raw b))
           | _ -> Lwt.return None)
-      | dir :: path -> (GitStore.read t sha >>= function
+      | dir :: path -> (match%lwt GitStore.read t sha with
           | Some (Git.Value.Tree tr) ->
             let en_opt =
               OpamStd.Option.of_Not_found
@@ -105,12 +105,12 @@ module RepoGit = struct
              | None -> Lwt.return None)
           | _ -> Lwt.return None)
     in
-    get_commit t sha >>= fun c ->
+    let%lwt c = get_commit t sha in
     follow_path (OpamStd.String.split path '/')
       (Git.Hash.of_tree c.Git.Commit.tree)
 
   let get_file_exn t sha path =
-    get_file t sha path >>= function
+    match%lwt get_file t sha path with
     | Some f -> Lwt.return f
     | None -> Lwt.fail Not_found
 
@@ -127,18 +127,20 @@ module RepoGit = struct
     GitSync.fetch t ~unpack:true (github_repo repo)
 
   let fetch_pr pull_request t =
-    fetch t pull_request.base.repo >>= fun _ ->
+    let%lwt _ = fetch t pull_request.base.repo in
     log "fetched upstream";
-    fetch t pull_request.head.repo >>= fun _head_fetch ->
+    let%lwt _head_fetch = fetch t pull_request.head.repo in
     log "fetched user repo";
     Lwt.return_unit
 
   let push t branch repo =
-    GitSync.push t ~branch:(branch_reference branch) (github_repo repo)
-    >|= function
-    | { Git.Sync.Result.result = `Ok; _ } -> ()
+    match%lwt
+      GitSync.push t ~branch:(branch_reference branch) (github_repo repo)
+    with
+    | { Git.Sync.Result.result = `Ok; _ } -> Lwt.return_unit
     | { Git.Sync.Result.result = `Error s; _ } ->
-      log "ERROR: could not push to %s: %s" branch s
+      log "ERROR: could not push to %s: %s" branch s;
+      Lwt.return_unit
 
   let common_ancestor pull_request t =
     log "Looking up common ancestor...";
@@ -148,10 +150,10 @@ module RepoGit = struct
     let all_parents s =
       Lwt_list.fold_left_s (fun acc sha ->
           try Lwt.return (acc ++ Hashtbl.find seen sha) with Not_found ->
-            get_commit t sha >|= fun c ->
+            let%lwt c = get_commit t sha in
             let p = S.of_list Git.(List.map Hash.of_commit c.Commit.parents) in
             Hashtbl.add seen sha p;
-            acc ++ p)
+            Lwt.return (acc ++ p))
         S.empty (S.elements s)
     in
     let seen_ancestors s =
@@ -173,29 +175,29 @@ module RepoGit = struct
         if S.subset current' (seen_ancestors common) then Lwt.return common
         else all_common descendents' current' descendents current
       else
-      all_parents current >>= fun current ->
+      let%lwt current = all_parents current in
       all_common descendents' current'
         (descendents ++ current) (current -- descendents)
     in
     let base = S.singleton (Git_unix.Hash_IO.of_hex pull_request.base.sha) in
     let head = S.singleton (Git_unix.Hash_IO.of_hex pull_request.head.sha) in
-    all_common base base head head >>= fun common ->
+    let%lwt common = all_common base base head head in
     let rec remove_older ancestors = fun s ->
       if S.is_empty s || S.is_empty ancestors ||
          S.subset s (S.singleton (S.choose s))
       then Lwt.return s
       else
-        all_parents ancestors >>= fun ancestors ->
+        let%lwt ancestors = all_parents ancestors in
         remove_older (ancestors -- s) (s -- ancestors)
     in
-    remove_older common common >|= fun found ->
+    let%lwt found = remove_older common common in
     log "found: %s"
       (OpamStd.List.concat_map " " Git.Hash.to_hex (S.elements found));
-    S.choose found
+    Lwt.return (S.choose found)
 
   let changed_files base head t =
-    tree_of_commit_sha t base >>= fun base_tree ->
-    tree_of_commit_sha t head >>= fun head_tree ->
+    let%lwt base_tree = tree_of_commit_sha t base in
+    let%lwt head_tree = tree_of_commit_sha t head in
     let tree_to_map path t =
       List.fold_left (fun m e ->
           M.add (path ^ "/" ^ e.Git.Tree.name) e.Git.Tree.node m)
@@ -207,10 +209,11 @@ module RepoGit = struct
         | [] -> Lwt.return acc
         | { Git.Tree.name; node; _ } :: right_tree ->
           let path = path ^ "/" ^ name in
-          GitStore.read_exn t node >>= fun right ->
-          (try GitStore.read t (M.find path left_map)
-           with Not_found -> Lwt.return None)
-          >>= fun left_opt ->
+          let%lwt right = GitStore.read_exn t node in
+          let%lwt left_opt =
+            try GitStore.read t (M.find path left_map)
+            with Not_found -> Lwt.return None
+          in
           if left_opt = Some right then read acc right_tree
           else match right with
             | Git.Value.Blob b ->
@@ -221,19 +224,19 @@ module RepoGit = struct
                 | Some (Git.Value.Tree t) -> t
                 | _ -> []
               in
-              changed_new acc path left_subtree right_subtree >>= fun acc ->
+              let%lwt acc = changed_new acc path left_subtree right_subtree in
               read acc right_tree
             | Git.Value.Tag _ | Git.Value.Commit _ ->
               Lwt.fail (Failure "Corrupted git state")
       in
       read acc right_tree
     in
-    changed_new M.empty "" base_tree head_tree >>= fun diff ->
+    let%lwt diff = changed_new M.empty "" base_tree head_tree in
     Lwt.return (M.bindings diff)
 
   let opam_files t sha =
     let rec find_opams acc path sha =
-      GitStore.read t sha >>= function
+      match%lwt GitStore.read t sha with
       | None | Some (Git.Value.Commit _) | Some (Git.Value.Tag _) ->
         Lwt.return acc
       | Some (Git.Value.Tree dir) ->
@@ -258,7 +261,7 @@ module RepoGit = struct
            | None -> Lwt.return acc)
         | _ -> Lwt.return acc
     in
-    tree_of_commit_sha t sha >>= fun root ->
+    let%lwt root = tree_of_commit_sha t sha in
     List.find (fun tr -> tr.Git.Tree.name = "packages") root |> fun en ->
     find_opams [] ["packages"] en.Git.Tree.node
 
@@ -282,9 +285,9 @@ module FormatUpgrade = struct
         (OpamPackage.to_string nv)
     in
     let opam_file = opam_dir^"opam" in
-    RepoGit.get_file_exn gitstore commit opam_file >>= fun opam_str ->
-    RepoGit.get_file gitstore commit (opam_dir^"url") >>= fun url_str ->
-    RepoGit.get_file gitstore commit (opam_dir^"descr") >>= fun descr_str ->
+    let%lwt opam_str = RepoGit.get_file_exn gitstore commit opam_file in
+    let%lwt url_str = RepoGit.get_file gitstore commit (opam_dir^"url") in
+    let%lwt descr_str = RepoGit.get_file gitstore commit (opam_dir^"descr") in
     let opam =
       OpamFile.OPAM.read_from_string
         ~filename:(OpamFile.make (OpamFilename.of_string opam_file))
@@ -317,8 +320,8 @@ module FormatUpgrade = struct
         comp_name comp_name
     in
     let filename = bname^".comp" in
-    RepoGit.get_file_exn gitstore commit filename >>= fun comp_str ->
-    RepoGit.get_file gitstore commit (bname^".descr") >>= fun descr_str ->
+    let%lwt comp_str = RepoGit.get_file_exn gitstore commit filename in
+    let%lwt descr_str = RepoGit.get_file gitstore commit (bname^".descr") in
     let comp =
       OpamFile.Comp.read_from_string
         ~filename:(OpamFile.make (OpamFilename.of_string filename))
@@ -352,18 +355,21 @@ module FormatUpgrade = struct
          OpamStd.String.Map.empty)
         changed_files
     in
-    Lwt_list.fold_left_s (fun acc comp_name ->
-        get_compiler_opam commit gitstore comp_name >|= fun (nv,opam) ->
-        OpamPackage.Map.add nv opam acc)
-      OpamPackage.Map.empty
-      (OpamStd.String.Set.elements compilers)
-    >>= fun compiler_packages ->
-    Lwt_list.fold_left_s (fun acc nv ->
-        get_updated_opam commit gitstore nv >|= fun opam ->
-        OpamPackage.Map.add nv opam acc)
-      compiler_packages
-      (OpamPackage.Set.elements packages)
-    >|= fun upgraded_packages ->
+    let%lwt compiler_packages =
+      Lwt_list.fold_left_s (fun acc comp_name ->
+          let%lwt nv, opam = get_compiler_opam commit gitstore comp_name in
+          Lwt.return (OpamPackage.Map.add nv opam acc))
+        OpamPackage.Map.empty
+        (OpamStd.String.Set.elements compilers)
+    in
+    let%lwt upgraded_packages =
+      Lwt_list.fold_left_s (fun acc nv ->
+          let%lwt opam = get_updated_opam commit gitstore nv in
+          Lwt.return (OpamPackage.Map.add nv opam acc))
+        compiler_packages
+        (OpamPackage.Set.elements packages)
+    in
+    Lwt.return @@
     OpamPackage.Map.fold (fun nv opam acc ->
         let f =
           Printf.sprintf "/packages/%s/%s/opam"
@@ -378,9 +384,10 @@ module FormatUpgrade = struct
     match path with
     | [] -> Lwt.fail (Failure "Empty path")
     | [file] ->
-      RepoGit.GitStore.write gitstore
-        (Git.Value.blob (Git.Blob.of_raw contents))
-      >>= fun hash ->
+      let%lwt hash =
+        RepoGit.GitStore.write gitstore
+          (Git.Value.blob (Git.Blob.of_raw contents))
+      in
       let entry = { Git.Tree.perm = `Normal; name = file; node = hash } in
       Lwt.return (entry :: List.filter (fun e -> e.Git.Tree.name <> file) tree)
     | dir::path ->
@@ -391,25 +398,27 @@ module FormatUpgrade = struct
                   tree).Git.Tree.node
         with Not_found -> None
       in
-      (match subtree with
-       | Some h -> RepoGit.get_tree gitstore h
-       | None -> Lwt.return [])
-      >>= fun subtree ->
-      add_file_to_tree gitstore subtree path contents >>= fun subtree ->
-      RepoGit.GitStore.write gitstore (Git.Value.tree subtree) >>= fun hash ->
+      let%lwt subtree =
+        match subtree with
+        | Some h -> RepoGit.get_tree gitstore h
+        | None -> Lwt.return []
+      in
+      let%lwt subtree = add_file_to_tree gitstore subtree path contents in
+      let%lwt hash = RepoGit.GitStore.write gitstore (Git.Value.tree subtree) in
       let entry = { Git.Tree.perm = `Dir; name = dir; node = hash } in
       Lwt.return (entry :: List.filter (fun e -> e.Git.Tree.name <> dir) tree)
 
   let gen_upgrade_commit ancestor head onto gitstore author message =
-    RepoGit.changed_files ancestor head gitstore >>= fun files ->
-    get_updated_subtree head gitstore files >>= fun replace_files ->
-    RepoGit.tree_of_commit_sha gitstore onto >>= fun onto_tree ->
-    Lwt_list.fold_left_s (fun tree (path,contents) ->
-        let path = OpamStd.String.split path '/' in
-        add_file_to_tree gitstore tree path contents)
-      onto_tree (OpamStd.String.Map.bindings replace_files)
-    >>= fun new_tree ->
-    RepoGit.GitStore.write gitstore (Git.Value.tree new_tree) >>= fun hash ->
+    let%lwt files = RepoGit.changed_files ancestor head gitstore in
+    let%lwt replace_files = get_updated_subtree head gitstore files in
+    let%lwt onto_tree = RepoGit.tree_of_commit_sha gitstore onto in
+    let%lwt new_tree =
+      Lwt_list.fold_left_s (fun tree (path,contents) ->
+          let path = OpamStd.String.split path '/' in
+          add_file_to_tree gitstore tree path contents)
+        onto_tree (OpamStd.String.Map.bindings replace_files)
+    in
+    let%lwt hash = RepoGit.GitStore.write gitstore (Git.Value.tree new_tree) in
     let commit =
       { Git.Commit.
         tree = Git.Hash.to_tree hash;
@@ -424,40 +433,40 @@ module FormatUpgrade = struct
   let run ancestor_s head_s gitstore repo =
     let ancestor = Git_unix.Hash_IO.of_hex ancestor_s in
     let head = Git_unix.Hash_IO.of_hex head_s in
-    RepoGit.fetch gitstore repo >>= fun fetch ->
+    let%lwt fetch = RepoGit.fetch gitstore repo in
     let remote_onto =
       Git.Reference.Map.find (RepoGit.branch_reference onto_branch)
         (Git.Sync.Result.references fetch)
     in
-    RepoGit.set_branch gitstore onto_branch remote_onto >>= fun () ->
+    let%lwt () = RepoGit.set_branch gitstore onto_branch remote_onto in
     log "Fetched new commits";
-    Lwt.catch (fun () ->
-        RepoGit.get_branch gitstore onto_branch >>= fun onto_head ->
-        RepoGit.get_commit gitstore head >>= fun head_commit ->
-        let author = head_commit.Git.Commit.author in
-        let message =
-          Printf.sprintf
-            "%s\n\n_translated to 2.0 format by Camelus_\n"
-            head_commit.Git.Commit.message
-        in
-        log "Rewriting commit %s (and possible parents) by %s"
-          head_s head_commit.Git.Commit.author.Git.User.name;
+    try%lwt
+      let%lwt onto_head = RepoGit.get_branch gitstore onto_branch in
+      let%lwt head_commit = RepoGit.get_commit gitstore head in
+      let author = head_commit.Git.Commit.author in
+      let message =
+        Printf.sprintf
+          "%s\n\n_translated to 2.0 format by Camelus_\n"
+          head_commit.Git.Commit.message
+      in
+      log "Rewriting commit %s (and possible parents) by %s"
+        head_s head_commit.Git.Commit.author.Git.User.name;
+      let%lwt commit_hash =
         gen_upgrade_commit ancestor head onto_head gitstore author message
-        >>= fun commit_hash ->
+      in
+      let%lwt () =
         RepoGit.set_branch gitstore onto_branch commit_hash
-        >>= fun () ->
-        log "Pushing new commit %s onto %s"
-          (Git.Hash.to_hex commit_hash) onto_branch;
-        RepoGit.push gitstore onto_branch repo
-        >>= fun () ->
-        log "Upgrade done";
-        Lwt.return_unit
-      )
-      (fun e ->
-         log "Upgrade and push to branch %s failed: %s\n%s" onto_branch
-           (Printexc.to_string e)
-           (Printexc.get_backtrace ());
-         Lwt.return_unit)
+      in
+      log "Pushing new commit %s onto %s"
+        (Git.Hash.to_hex commit_hash) onto_branch;
+      let%lwt () = RepoGit.push gitstore onto_branch repo in
+      log "Upgrade done";
+      Lwt.return_unit
+    with e ->
+      log "Upgrade and push to branch %s failed: %s\n%s" onto_branch
+        (Printexc.to_string e)
+        (Printexc.get_backtrace ());
+      Lwt.return_unit
 
 
 (*
@@ -541,7 +550,7 @@ module PrChecks = struct
   let max_items_in_post = 50
 
   let lint ancestor head gitstore =
-    RepoGit.changed_files ancestor head gitstore >|= fun files ->
+    let%lwt files = RepoGit.changed_files ancestor head gitstore in
     let opam_files =
       List.filter (fun (s,_) ->
           OpamStd.String.starts_with ~prefix:"/packages/" s &&
@@ -640,10 +649,11 @@ module PrChecks = struct
       else if warnings <> [] then `Warnings (List.map pkgname warnings)
       else `Passed
     in
-    status, String.concat "" [title; errs; warns; pass]
+    Lwt.return
+      (status, String.concat "" [title; errs; warns; pass])
 
   let installable gitstore sha =
-    RepoGit.opam_files gitstore sha >>= fun opams ->
+    let%lwt opams = RepoGit.opam_files gitstore sha in
     log "opam files at %s: %d" (Git.Hash.to_hex sha) (List.length opams);
     let open OpamTypes in
     let m =
@@ -704,10 +714,12 @@ module PrChecks = struct
     Lwt.return (packages, installable)
 
   let installability_check ancestor head gitstore =
-    installable gitstore ancestor
-    >>= fun (packages_before, installable_before) ->
-    installable gitstore head
-    >>= fun (packages_after, installable_after) ->
+    let%lwt packages_before, installable_before =
+      installable gitstore ancestor
+    in
+    let%lwt packages_after, installable_after =
+      installable gitstore head
+    in
     let open OpamPackage.Set.Op in
     let fresh = packages_after -- packages_before in
     let broken_before = packages_before -- installable_before in
@@ -761,18 +773,18 @@ module PrChecks = struct
     | `Passed, `Passed -> `Passed
 
   let run pr gitstore =
-    RepoGit.fetch_pr pr gitstore >>= fun () ->
+    let%lwt () = RepoGit.fetch_pr pr gitstore in
     let head = Git_unix.Hash_IO.of_hex pr.head.sha in
-    RepoGit.common_ancestor pr gitstore >>= fun ancestor ->
-    lint ancestor head gitstore >>= fun (stlint,msglint) ->
-    Lwt.catch (fun () ->
-      installability_check ancestor head gitstore >>= fun (stinst,msginst) ->
+    let%lwt ancestor = RepoGit.common_ancestor pr gitstore in
+    let%lwt (stlint,msglint) = lint ancestor head gitstore in
+    try%lwt
+      let%lwt (stinst,msginst) = installability_check ancestor head gitstore in
       Lwt.return (add_status stlint stinst,
-                  msglint ^ "\n\n---\n" ^ msginst))
-      (fun e ->
+                  msglint ^ "\n\n---\n" ^ msginst)
+    with e ->
         log "Installability check failed: %s%s" (Printexc.to_string e)
           (Printexc.get_backtrace ());
-        Lwt.return (stlint, msglint))
+        Lwt.return (stlint, msglint)
 
 end
 
@@ -926,7 +938,7 @@ module Webhook_handler = struct
 
   let server ~port ~secret ~handler =
     let callback (conn, _) req body =
-      Cohttp_lwt_body.to_string body >>= fun body ->
+      let%lwt body = Cohttp_lwt_body.to_string body in
       if not (check_github ~secret req body) then
         (log "Ignored invalid request:\n%s"
            (OpamStd.Format.itemize (fun s -> s)
@@ -948,7 +960,7 @@ module Webhook_handler = struct
         | Some "pull_request" ->
           (match pull_request_of_json json with
            | Some pr ->
-             handler (`Pr pr) >>= fun () ->
+             let%lwt () = handler (`Pr pr) in
              Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
            | None ->
              Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
@@ -959,7 +971,7 @@ module Webhook_handler = struct
         | Some "push" ->
           (match push_event_of_json json with
            | Some push ->
-             handler (`Push push) >>= fun () ->
+             let%lwt () = handler (`Push push) in
              Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
            | None ->
              Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
@@ -1044,56 +1056,62 @@ let () =
   let event_stream, event_push = Lwt_stream.create () in
   let rec check_loop gitstore =
     (* The checks are done sequentially *)
-    Lwt.catch
-       (fun () ->
-          Lwt_stream.next event_stream >>= function
-          | `Pr pr ->
-            log "=> PR #%d received \
-                 (onto %s/%s#%s from %s/%s#%s, commit %s over %s)"
-              pr.number
-              pr.base.repo.user pr.base.repo.name pr.base.ref
-              pr.head.repo.user pr.head.repo.name pr.head.ref
-              pr.head.sha pr.base.sha;
-            Lwt.catch (fun () ->
-                PrChecks.run pr gitstore >>= fun report ->
-                Github_comment.push_report
-                  ~name:conf.Conf.name
-                  ~token:conf.Conf.token
-                  ~report
-                  pr)
-              (fun exn ->
-                 log "Check failed: %s" (Printexc.to_string exn);
-                 Github_comment.push_status
-                   ~name:conf.Conf.name ~token:conf.Conf.token pr
-                   ~text:"Could not complete" `Failure
-                 >>= fun _ -> Lwt.return_unit)
-          | `Push p ->
-            log "=> Push received (head %s onto %s)"
-              p.push_head p.push_ancestor;
-            Lwt.catch (fun () ->
-                FormatUpgrade.run
-                  p.push_ancestor p.push_head gitstore
-                  { p.push_repo with auth = Some auth })
-              (fun exn ->
-                 log "Upgrade commit failed: %s" (Printexc.to_string exn);
-                 Lwt.return_unit))
-       (function
-         | Lwt_stream.Empty -> exit 0
-         | exn ->
-           log "Event handler failed: %s" (Printexc.to_string exn);
-           Lwt.return_unit)
-    >>= fun () -> check_loop gitstore
+    let%lwt () =
+      try%lwt
+        match%lwt Lwt_stream.next event_stream with
+        | `Pr pr ->
+          (log "=> PR #%d received \
+                (onto %s/%s#%s from %s/%s#%s, commit %s over %s)"
+             pr.number
+             pr.base.repo.user pr.base.repo.name pr.base.ref
+             pr.head.repo.user pr.head.repo.name pr.head.ref
+             pr.head.sha pr.base.sha;
+           try%lwt
+             let%lwt report = PrChecks.run pr gitstore in
+             Github_comment.push_report
+               ~name:conf.Conf.name
+               ~token:conf.Conf.token
+               ~report
+               pr
+           with exn ->
+             log "Check failed: %s" (Printexc.to_string exn);
+             let%lwt _ =
+               Github_comment.push_status
+                 ~name:conf.Conf.name ~token:conf.Conf.token pr
+                 ~text:"Could not complete" `Failure
+             in Lwt.return_unit)
+        | `Push p ->
+          log "=> Push received (head %s onto %s)"
+            p.push_head p.push_ancestor;
+          try%lwt
+            FormatUpgrade.run
+              p.push_ancestor p.push_head gitstore
+              { p.push_repo with auth = Some auth }
+          with exn ->
+            log "Upgrade commit failed: %s" (Printexc.to_string exn);
+            Lwt.return_unit
+      with
+      | Lwt_stream.Empty -> exit 0
+      | exn ->
+        log "Event handler failed: %s" (Printexc.to_string exn);
+        Lwt.return_unit
+    in
+    check_loop gitstore
   in
   let handler event =
-    (match event with
-     | `Pr pr ->
-       Github_comment.push_status
-         ~name:conf.Conf.name ~token:conf.Conf.token pr
-         ~text:"In progress" `Pending >>= fun _ ->
-       Lwt.return_unit
-     | _ ->
-       Lwt.return_unit)
-    >>= fun () -> Lwt.return (event_push (Some event))
+    let%lwt () =
+      match event with
+      | `Pr pr ->
+        let%lwt _ =
+          Github_comment.push_status
+            ~name:conf.Conf.name ~token:conf.Conf.token pr
+            ~text:"In progress" `Pending
+        in
+        Lwt.return_unit
+      | _ ->
+        Lwt.return_unit
+    in
+    Lwt.return (event_push (Some event))
   in
   Lwt_main.run (Lwt.join [
       RepoGit.get conf.Conf.repo >>= check_loop;

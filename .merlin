@@ -1,6 +1,5 @@
 B .
-FLG -w -40
-PKG lwt
+PKG lwt lwt.ppx
 PKG git
 PKG git-unix
 PKG github-unix
