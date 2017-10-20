@@ -332,6 +332,92 @@ module FormatUpgrade = struct
     in
     Lwt.return opam_str
 
+  module CompilerConversion = struct
+    (* Taken from OpamAdminRepoUpgrade ; should be generalised and called *)
+    open OpamStd.Option.Op
+    open OpamProcess.Job.Op
+
+    let cache_file : string list list OpamFile.t =
+      OpamFile.make @@
+      OpamFilename.of_string "~/.cache/opam-compilers-to-packages/url-hashes"
+
+    let get_url_md5, save_cache =
+      let url_md5 = Hashtbl.create 187 in
+      let () =
+        OpamFile.Lines.read_opt cache_file +! [] |> List.iter @@ function
+        | [url; md5] ->
+          Hashtbl.add url_md5 (OpamUrl.of_string url) (OpamHash.of_string md5)
+        | _ -> failwith "Bad cache, run 'opam admin upgrade --clear-cache'"
+      in
+      (fun url ->
+         try Done (Some (Hashtbl.find url_md5 url))
+         with Not_found ->
+           OpamFilename.with_tmp_dir_job @@ fun dir ->
+           OpamProcess.Job.ignore_errors ~default:None
+             (fun () ->
+                OpamDownload.download ~overwrite:false url dir @@| fun f ->
+                let hash = OpamHash.compute (OpamFilename.to_string f) in
+                Hashtbl.add url_md5 url hash;
+                Some hash)),
+      (fun () ->
+         Hashtbl.fold
+           (fun url hash l -> [OpamUrl.to_string url; OpamHash.to_string hash]::l)
+           url_md5 [] |>
+         OpamFile.Lines.write cache_file)
+
+    let opam_of_comp comp_name comp descr =
+      let nv =
+        match OpamStd.String.cut_at comp_name '+' with
+        | None ->
+          OpamPackage.create (OpamPackage.Name.of_string "ocaml-base-compiler")
+            (OpamPackage.Version.of_string comp_name)
+        | Some (version,variant) ->
+          OpamPackage.create (OpamPackage.Name.of_string "ocaml-variants")
+            (OpamPackage.Version.of_string (version^"+"^variant))
+      in
+      let opam =
+        OpamFile.Comp.to_package ~package:nv comp descr |>
+        OpamFile.OPAM.with_conflict_class
+          [OpamPackage.Name.of_string "ocaml-core-compiler"]
+      in
+      let opam =
+        match OpamFile.OPAM.url opam with
+        | Some urlf when OpamFile.URL.checksum urlf = [] ->
+          (match OpamProcess.Job.run (get_url_md5 (OpamFile.URL.url urlf)) with
+           | None ->
+             Printf.ksprintf failwith "Could not get the archive of %s."
+               (OpamPackage.to_string nv)
+           | Some hash ->
+             OpamFile.OPAM.with_url (OpamFile.URL.with_checksum [hash] urlf)
+               opam)
+        | _ -> opam
+      in
+      let patches = OpamFile.Comp.patches comp in
+      if patches <> [] then
+        log "Fetching patches of %s to check their hashes...\n"
+          (OpamPackage.to_string nv);
+      let extra_sources =
+        (* Download them just to get their MD5 *)
+        OpamParallel.map
+          ~jobs:3
+          ~command:(fun url ->
+              get_url_md5 url @@| function
+              | Some md5 -> url, md5
+              | None ->
+                Printf.ksprintf failwith
+                  "Could not get patch file for %s from %s, skipping"
+                  (OpamPackage.to_string nv) (OpamUrl.to_string url))
+          (OpamFile.Comp.patches comp)
+      in
+      OpamFile.OPAM.with_extra_sources
+        (List.map (fun (url, hash) ->
+             OpamFilename.Base.of_string (OpamUrl.basename url),
+             OpamFile.URL.create ~checksum:[hash] url)
+            extra_sources)
+        opam
+
+  end
+
   let get_compiler_opam commit gitstore comp_name =
     let bname =
       Printf.sprintf "/compilers/%s/%s/%s"
@@ -350,8 +436,12 @@ module FormatUpgrade = struct
     let descr =
       OpamStd.Option.map OpamFile.Descr.read_from_string descr_str
     in
-    let opam = OpamFile.Comp.to_package comp descr in
-    let opam_str = OpamFile.OPAM.write_to_string opam in
+    let opam =
+      CompilerConversion.opam_of_comp comp_name comp descr |>
+      OpamFile.OPAM.with_name_opt None |>
+      OpamFile.OPAM.with_version_opt None
+    in
+    let opam_str = OpamFile.OPAM.write_to_string opam ^"\n" in
     Lwt.return (OpamFile.OPAM.package opam, opam_str)
 
   let get_updated_subtree commit gitstore changed_files =
