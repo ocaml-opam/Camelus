@@ -463,7 +463,7 @@ module FormatUpgrade = struct
     let commit =
       { Git.Commit.
         tree = Git.Hash.to_tree hash;
-        parents = [Git.Hash.to_commit onto];
+        parents = [Git.Hash.to_commit onto; Git.Hash.to_commit head];
         author = author;
         committer = git_identity ();
         message = message;
@@ -484,11 +484,12 @@ module FormatUpgrade = struct
     try%lwt
       let%lwt onto_head = RepoGit.get_branch gitstore onto_branch in
       let%lwt head_commit = RepoGit.get_commit gitstore head in
-      let author = head_commit.Git.Commit.author in
+      let author = git_identity () in
       let message =
         Printf.sprintf
-          "%s\n\n_translated to 2.0 format by Camelus_\n"
-          head_commit.Git.Commit.message
+          "Merge changes from 1.2 format repo\n\n\
+           Merge done by Camelus based on opam-lib %s"
+          OpamVersion.(to_string (full ()))
       in
       log "Rewriting commit %s (and possible parents) by %s"
         head_s head_commit.Git.Commit.author.Git.User.name;
