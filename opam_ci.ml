@@ -133,7 +133,26 @@ module RepoGit = struct
     log "fetched user repo";
     Lwt.return_unit
 
-  let push t branch repo =
+  let push t hash branch repo =
+    let dir = Sys.getcwd () in
+    let cmd = [|
+      "git"; "push"; (* "--force"; *)
+      Git.Gri.to_string (github_repo repo);
+      Git.Hash.to_hex hash ^":"^ branch;
+    |] in
+    log "Calling out to git: %s" (String.concat " " (Array.to_list cmd));
+    Sys.chdir (local_mirror repo);
+    match%lwt
+      (OpamSystem.write ".git/HEAD" "ref: refs/heads/master";
+       Lwt_process.exec ("git", cmd))
+        [%lwt.finally Sys.chdir dir; Lwt.return_unit]
+    with
+    | Unix.WEXITED 0 -> Lwt.return_unit
+    | _ ->
+      log "ERROR: could not push to %s." branch;
+      Lwt.return_unit
+
+(*
     match%lwt
       GitSync.push t ~branch:(branch_reference branch) (github_repo repo)
     with
@@ -141,6 +160,7 @@ module RepoGit = struct
     | { Git.Sync.Result.result = `Error s; _ } ->
       log "ERROR: could not push to %s: %s" branch s;
       Lwt.return_unit
+*)
 
   let common_ancestor pull_request t =
     log "Looking up common ancestor...";
@@ -459,7 +479,7 @@ module FormatUpgrade = struct
       in
       log "Pushing new commit %s onto %s"
         (Git.Hash.to_hex commit_hash) onto_branch;
-      let%lwt () = RepoGit.push gitstore onto_branch repo in
+      let%lwt () = RepoGit.push gitstore commit_hash onto_branch repo in
       log "Upgrade done";
       Lwt.return_unit
     with e ->
@@ -467,79 +487,6 @@ module FormatUpgrade = struct
         (Printexc.to_string e)
         (Printexc.get_backtrace ());
       Lwt.return_unit
-
-
-(*
-    >>= fun commit_hash ->
-    
-
-    
-    let compilers, packages =
-      List.fold_left (fun (compilers, packages) (f, _) ->
-          try Scanf.sscanf f "/compilers/%_s@/%s@/"
-                (fun s -> OpamStd.String.Set.add s compilers, packages)
-          with Scanf.Scan_failure _ ->
-            Scanf.sscanf f "/packages/%_s@/%s@/"
-              (fun s ->
-                 compilers,
-                 OpamPackage.Set.add (OpamPackage.of_string s) packages))
-        (OpamStd.String.Set.empty, OpamPackage.Set.empty)
-        files
-    in
-    let compiler_packages =
-      Lwt_list.fold_left_s (fun acc comp_name ->
-          get_compiler_opam head gitstore comp_name >|= fun (nv,opam) ->
-          OpamPackage.Map.add nv opam acc)
-        OpamPackage.Map.empty
-        (OpamStd.String.Set.elements compilers)
-    in
-    let modified_packages =
-      compiler_packages >|= fun comps ->
-      OpamPackage.Set.union (OpamPackage.keys comps) packages
-    in
-    let ugraded_packages =
-      Lwt_list.fold_left_s (fun acc nv ->
-          get_updated_opam head gitstore nv >|= fun opam ->
-          OpamPackage.Map.add nv opam acc)
-        OpamPackage.Map.empty
-        (OpamPackage.Set.elements packages)
-    in
-    let new_subtree =
-      (* compiler packages + updated packages + modified package files/ *)
-    let 
-
-          RepoGit.get_file gitstore head comp_file >>= fun comp_str ->
-          RepoGit.get_file gitstore head
-            (Filename.chop_extension comp_file ^ ".descr") >>= fun descr_str ->
-          match comp_str with
-          | Some comp_str ->
-            let comp =
-              OpamFile.Comp.read_from_string
-                ~filename:(OpamFile.make (OpamFilename.of_string comp_file))
-                comp_str
-            in
-            let descr =
-              OpamStd.Option.map OpamFile.Descr.read_from_string descr_str
-            in
-            let opam = OpamFile.Comp.to_package comp descr in
-            Lwt.return
-              (OpamPackage.Map.add (OpamFile.OPAM.package opam) opam acc)
-          | None -> Lwt.return acc)
-        OpamPackage.Map.empty
-        (OpamStd.String.Set.elements packages)
-    in
-    
-      
-            
-      
-    let opam_files =
-      List.filter (fun (s,_) ->
-          OpamStd.String.starts_with ~prefix:"/packages/" s &&
-          OpamStd.String.ends_with ~suffix:"/opam" s)
-        files
-    in
-    
-*)
 
 end
 
