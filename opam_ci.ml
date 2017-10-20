@@ -401,6 +401,27 @@ module FormatUpgrade = struct
       files
 
   let rec add_file_to_tree gitstore tree path contents =
+    let git_compare a b =
+      let la = String.length a in
+      let lb = String.length b in
+      let rec aux i =
+        if i >= la then
+          if i >= lb then 0 else 1
+        else if i >= lb then -1
+        else match Char.compare a.[i] b.[i] with
+          | 0 -> aux (i+1)
+          | c -> c
+      in
+      aux 0
+    in
+    let rec add_to_tree entry = function
+      | [] -> [entry]
+      | e :: tree ->
+        let cmp = git_compare e.Git.Tree.name entry.Git.Tree.name in
+        if cmp < 0 then e :: add_to_tree entry tree else
+        if cmp > 0 then entry :: e :: tree
+        else entry :: tree
+    in
     match path with
     | [] -> Lwt.fail (Failure "Empty path")
     | [file] ->
@@ -409,7 +430,7 @@ module FormatUpgrade = struct
           (Git.Value.blob (Git.Blob.of_raw contents))
       in
       let entry = { Git.Tree.perm = `Normal; name = file; node = hash } in
-      Lwt.return (entry :: List.filter (fun e -> e.Git.Tree.name <> file) tree)
+      Lwt.return (add_to_tree entry tree)
     | dir::path ->
       let subtree =
         try
@@ -426,7 +447,7 @@ module FormatUpgrade = struct
       let%lwt subtree = add_file_to_tree gitstore subtree path contents in
       let%lwt hash = RepoGit.GitStore.write gitstore (Git.Value.tree subtree) in
       let entry = { Git.Tree.perm = `Dir; name = dir; node = hash } in
-      Lwt.return (entry :: List.filter (fun e -> e.Git.Tree.name <> dir) tree)
+      Lwt.return (add_to_tree entry tree)
 
   let gen_upgrade_commit ancestor head onto gitstore author message =
     let%lwt files = RepoGit.changed_files ancestor head gitstore in
