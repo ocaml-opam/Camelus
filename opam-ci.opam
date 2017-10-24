@@ -1,0 +1,18 @@
+opam-version: "2.0"
+version: "0.2"
+synopsis: "Automated checks and management for opam repositories on Github"
+maintainer: "Louis Gesbert <louis.gesbert@ocamlpro.com>"
+authors: "Louis Gesbert <louis.gesbert@ocamlpro.com>"
+homepage: "https://github.com/AltGr/Camelus"
+bug-reports: "https://github.com/AltGr/Camelus/issues"
+dev-repo: "git+https://github.com/AltGr/Camelus.git"
+depends: [
+  "cohttp-lwt-unix"
+  "opam-format" {>= "2.0.0~beta5"}
+  "opam-solver" {>= "2.0.0~beta5"}
+  "opam-state" {>= "2.0.0~beta5"}
+  "git-unix" {>= "1.11" & < "2.0"}
+  "github-unix"
+  "yojson"
+]
+build: make
