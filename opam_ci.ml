@@ -215,9 +215,7 @@ module RepoGit = struct
       (OpamStd.List.concat_map " " Git.Hash.to_hex (S.elements found));
     Lwt.return (S.choose found)
 
-  let changed_files base head t =
-    let%lwt base_tree = tree_of_commit_sha t base in
-    let%lwt head_tree = tree_of_commit_sha t head in
+  let changed_files_tree base_tree head_tree t =
     let tree_to_map path t =
       List.fold_left (fun m e ->
           M.add (path ^ "/" ^ e.Git.Tree.name) e.Git.Tree.node m)
@@ -253,6 +251,11 @@ module RepoGit = struct
     in
     let%lwt diff = changed_new M.empty "" base_tree head_tree in
     Lwt.return (M.bindings diff)
+
+  let changed_files base head t =
+    let%lwt base_tree = tree_of_commit_sha t base in
+    let%lwt head_tree = tree_of_commit_sha t head in
+    changed_files_tree base_tree head_tree t
 
   let opam_files t sha =
     let rec find_opams acc path sha =
@@ -539,9 +542,8 @@ module FormatUpgrade = struct
       let entry = { Git.Tree.perm = `Dir; name = dir; node = hash } in
       Lwt.return (add_to_tree entry tree)
 
-  let gen_upgrade_commit ancestor head onto gitstore author message =
-    let%lwt files = RepoGit.changed_files ancestor head gitstore in
-    let%lwt replace_files = get_updated_subtree head gitstore files in
+  let gen_upgrade_commit changed_files head onto gitstore author message =
+    let%lwt replace_files = get_updated_subtree head gitstore changed_files in
     let%lwt onto_tree = RepoGit.tree_of_commit_sha gitstore onto in
     let%lwt new_tree =
       Lwt_list.fold_left_s (fun tree (path,contents) ->
@@ -560,6 +562,22 @@ module FormatUpgrade = struct
       }
     in
     RepoGit.GitStore.write gitstore (Git.Value.commit commit)
+
+  (** We have conflicts if [onto] was changed in the meantime, i.e. the rewrite
+      of [ancestor] doesn't match what we have at the current [onto]. This is
+      the case where we don't want to force an overwrite *)
+  let check_for_conflicts changed_files ancestor onto gitstore =
+    let%lwt rewritten_ancestor_tree =
+      get_updated_subtree ancestor gitstore changed_files
+    in
+    let rec is_changed = function
+      | (path, contents) :: r ->
+        (match%lwt RepoGit.get_file gitstore onto path with
+         | Some c when c <> contents -> Lwt.return true
+         | _ -> is_changed r)
+      | [] -> Lwt.return false
+    in
+    is_changed (OpamStd.String.Map.bindings rewritten_ancestor_tree)
 
   let run ancestor_s head_s gitstore repo =
     let ancestor = Git_unix.Hash_IO.of_hex ancestor_s in
@@ -584,22 +602,31 @@ module FormatUpgrade = struct
       in
       log "Rewriting commit %s (and possible parents) by %s"
         head_s head_commit.Git.Commit.author.Git.User.name;
+      let%lwt changed_files = RepoGit.changed_files ancestor head gitstore in
       let%lwt commit_hash =
-        gen_upgrade_commit ancestor head onto_head gitstore author message
+        gen_upgrade_commit changed_files head onto_head gitstore author message
+      in
+      let%lwt has_conflicts =
+        check_for_conflicts changed_files ancestor onto_head gitstore
+      in
+      let dest_branch =
+        if has_conflicts then "camelus-"^head_s
+        else onto_branch
       in
       let%lwt () =
-        RepoGit.set_branch gitstore onto_branch commit_hash
+        RepoGit.set_branch gitstore dest_branch commit_hash
       in
-      log "Pushing new commit %s onto %s"
-        (Git.Hash.to_hex commit_hash) onto_branch;
-      let%lwt () = RepoGit.push gitstore commit_hash onto_branch repo in
+      log "Pushing new commit %s onto %s (there are %sconflicts)"
+        (Git.Hash.to_hex commit_hash) dest_branch
+        (if has_conflicts then "" else "no ");
+      let%lwt () = RepoGit.push gitstore commit_hash dest_branch repo in
       log "Upgrade done";
-      Lwt.return_unit
+      Lwt.return (if has_conflicts then Some dest_branch else None)
     with e ->
       log "Upgrade and push to branch %s failed: %s\n%s" onto_branch
         (Printexc.to_string e)
         (Printexc.get_backtrace ());
-      Lwt.return_unit
+      Lwt.return None
 
 end
 
@@ -913,6 +940,22 @@ module Github_comment = struct
       return (log "Comment posted back to PR #%d" pr.number);
     )
 
+  let pull_request ~name ~token repo branch target_branch ?message title =
+    log "Pull-requesting...";
+    let pr () =
+      let pull = {
+        new_pull_title = title;
+        new_pull_body = message;
+        new_pull_base = target_branch;
+        new_pull_head = branch;
+      } in
+      Github.Pull.create ~token ~user:repo.user ~repo:repo.name ~pull ()
+    in
+    run (
+      pr () >>= fun resp ->
+      return (log "Filed pull-request #%d" resp#value.pull_number)
+    )
+
 end
 
 module Webhook_handler = struct
@@ -1105,6 +1148,8 @@ module Conf = struct
 end
 
 let () =
+  (* Logs.set_reporter (Logs.format_reporter ());
+   * Logs.set_level (Some Logs.Debug); *)
   let conf =
     let f = OpamFile.make (OpamFilename.of_string "opam-ci.conf") in
     try Conf.read f with _ ->
@@ -1143,13 +1188,23 @@ let () =
         | `Push p ->
           log "=> Push received (head %s onto %s)"
             p.push_head p.push_ancestor;
-          try%lwt
-            FormatUpgrade.run
-              p.push_ancestor p.push_head gitstore
-              { p.push_repo with auth = Some auth }
-          with exn ->
-            log "Upgrade commit failed: %s" (Printexc.to_string exn);
-            Lwt.return_unit
+          let%lwt pr_branch =
+            try%lwt
+              FormatUpgrade.run
+                p.push_ancestor p.push_head gitstore
+                { p.push_repo with auth = Some auth }
+            with exn ->
+              log "Upgrade commit failed: %s%s" (Printexc.to_string exn)
+                (Printexc.get_backtrace ());
+              Lwt.return None
+          in
+          match pr_branch with
+          | None -> Lwt.return_unit
+          | Some branch ->
+            Github_comment.pull_request
+              ~name:conf.Conf.name ~token:conf.Conf.token conf.Conf.repo
+              branch FormatUpgrade.onto_branch
+              "Merge changes from 1.2 format repo"
       with
       | Lwt_stream.Empty -> exit 0
       | exn ->
