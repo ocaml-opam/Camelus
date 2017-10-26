@@ -565,12 +565,13 @@ module FormatUpgrade = struct
     let ancestor = Git_unix.Hash_IO.of_hex ancestor_s in
     let head = Git_unix.Hash_IO.of_hex head_s in
     let%lwt fetch = RepoGit.fetch gitstore repo in
+    log "Fetched new commits";
     let remote_onto =
       Git.Reference.Map.find (RepoGit.branch_reference onto_branch)
         (Git.Sync.Result.references fetch)
     in
     let%lwt () = RepoGit.set_branch gitstore onto_branch remote_onto in
-    log "Fetched new commits";
+    log "Updated branch";
     try%lwt
       let%lwt onto_head = RepoGit.get_branch gitstore onto_branch in
       let%lwt head_commit = RepoGit.get_commit gitstore head in
