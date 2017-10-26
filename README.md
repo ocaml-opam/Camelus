@@ -37,3 +37,14 @@ secret should correspond to the webhook configuration, and the service is at
 
 The repository is cloned (bare) under `name%repo.git/.git` in the current
 directory, _e.g._ `opam%opam-repository.git/.git`.
+
+NOTE: due to limitations of the current `ocaml-git`, cloning the repository may
+take up a lot of memory. To workaround, you can do it manually using `git`, but
+you also need to unpack:
+
+```
+cd opam%opam-repository.git/
+git clone --bare https://github.com/ocaml/opam-repository.git .git
+mv .git/objects/pack/* .
+git unpack-objects <*.pack
+```
