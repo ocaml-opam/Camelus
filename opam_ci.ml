@@ -138,7 +138,7 @@ module RepoGit = struct
     let cmd = [|
       "git"; "push"; (* "--force"; *)
       Git.Gri.to_string (github_repo repo);
-      Git.Hash.to_hex hash ^":"^ branch;
+      Git.Hash.to_hex hash ^":refs/heads/"^ branch;
     |] in
     log "Calling out to git: %s" (String.concat " " (Array.to_list cmd));
     Sys.chdir (local_mirror repo);
@@ -610,7 +610,7 @@ module FormatUpgrade = struct
         check_for_conflicts changed_files ancestor onto_head gitstore
       in
       let dest_branch =
-        if has_conflicts then "camelus-"^head_s
+        if has_conflicts then "camelus-"^(String.sub head_s 0 8)
         else onto_branch
       in
       let%lwt () =
@@ -1194,17 +1194,20 @@ let () =
                 p.push_ancestor p.push_head gitstore
                 { p.push_repo with auth = Some auth }
             with exn ->
-              log "Upgrade commit failed: %s%s" (Printexc.to_string exn)
-                (Printexc.get_backtrace ());
+              log "Upgrade commit failed: %s" (Printexc.to_string exn);
               Lwt.return None
           in
           match pr_branch with
           | None -> Lwt.return_unit
           | Some branch ->
-            Github_comment.pull_request
-              ~name:conf.Conf.name ~token:conf.Conf.token conf.Conf.repo
-              branch FormatUpgrade.onto_branch
-              "Merge changes from 1.2 format repo"
+            try%lwt
+              Github_comment.pull_request
+                ~name:conf.Conf.name ~token:conf.Conf.token conf.Conf.repo
+                branch FormatUpgrade.onto_branch
+                "Merge changes from 1.2 format repo"
+            with exn ->
+              log "Pull request failed: %s" (Printexc.to_string exn);
+              Lwt.return_unit
       with
       | Lwt_stream.Empty -> exit 0
       | exn ->
