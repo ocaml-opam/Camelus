@@ -46,14 +46,53 @@ type push_event = {
   push_ancestor: string;
 }
 
+module CohttpClient =
+struct
+  type headers = Cohttp.Header.t
+  type resp = Git_http.Web_cohttp_lwt.resp =
+    { resp : Cohttp.Response.t
+    ; body : Cohttp_lwt.Body.t }
+  type body = unit -> (Cstruct.t * int * int) option Lwt.t
+  type meth = Cohttp.Code.meth
+  type uri = Uri.t
+
+  type +'a io = 'a Lwt.t
+
+  let call ?headers ?body meth uri =
+    let open Lwt.Infix in
+
+    let body = match body with
+      | None -> None
+      | Some stream ->
+        Lwt_stream.from stream
+        |> Lwt_stream.map (fun (buf, off, len) -> Cstruct.to_string (Cstruct.sub buf off len))
+        |> fun stream -> Some (`Stream stream)
+    in
+
+    Cohttp_lwt_unix.Client.call ?headers ?body ~chunked:false meth uri >>= fun ((resp, _) as v) ->
+    if Cohttp.Code.is_redirection (Cohttp.Code.code_of_status (Cohttp.Response.status resp))
+    then begin
+      let uri =
+        Cohttp.Response.headers resp
+        |> Cohttp.Header.to_list
+        |> List.assoc "location"
+        |> Uri.of_string
+      in
+
+      Cohttp_lwt_unix.Client.call ?headers ?body ~chunked:false meth uri >>= fun (resp, body) ->
+      Lwt.return { resp; body; }
+    end else Lwt.return { resp; body = snd v; }
+end
+
 module RepoGit = struct
 
-  module GitStore = Git_unix.FS
-  module GitSync = Git_unix.Sync.Make(GitStore)
+  module GitStore = Git_unix.Store
+  module GitSyncHttp = Git_http.Make(Git_http.Default)(CohttpClient)(GitStore)
+  module GitNegociation = Git.Negociator.Make(Git_unix.Store)
   module M = OpamStd.String.Map
 
   let github_repo repo =
-    Git.Gri.of_string
+    Uri.of_string
       (Printf.sprintf "https://%sgithub.com/%s/%s.git"
          (match repo.auth with
           | None -> ""
@@ -61,30 +100,30 @@ module RepoGit = struct
          repo.user repo.name)
 
   let local_mirror repo =
-    Printf.sprintf "./%s%%%s.git" repo.user repo.name
+    Fpath.v (Fmt.strf "./%s%%%s.git" repo.user repo.name)
 
   let get_commit t sha =
     match%lwt GitStore.read t sha with
-    | Some (Git.Value.Commit c) -> Lwt.return c
-    | Some x ->
-      let kind = Git.Object_type.to_string (Git.Value.type_of x) in
-      Lwt.fail (Failure (Printf.sprintf "Not a commit (%s: %s)"
-                           (Git.Hash.to_hex sha) kind))
-    | None ->
-      Lwt.fail (Failure (Printf.sprintf "Commit %s not found"
-                           (Git.Hash.to_hex sha)))
+    | Ok (GitStore.Value.Commit c) -> Lwt.return c
+    | Ok x ->
+      let kind = GitStore.Value.kind x in
+      Lwt.fail (Failure (Fmt.strf "Not a commit (%a: %a)"
+                           GitStore.Hash.pp sha GitStore.Value.pp_kind kind))
+    | Error err ->
+      Lwt.fail (Failure (Fmt.strf "Commit %a not found: %a"
+                           GitStore.Hash.pp sha GitStore.pp_error err))
 
   let get_tree t sha =
     match%lwt GitStore.read_exn t sha with
-    | Git.Value.Tree t -> Lwt.return t
+    | GitStore.Value.Tree t -> Lwt.return t
     | x ->
-      let kind = Git.Object_type.to_string (Git.Value.type_of x) in
-      Lwt.fail (Failure (Printf.sprintf "Not a tree (%s: %s)"
-                           (Git.Hash.to_hex sha) kind))
+      let kind = GitStore.Value.kind x in
+      Lwt.fail (Failure (Fmt.strf "Not a tree (%a: %a)"
+                           GitStore.Hash.pp sha GitStore.Value.pp_kind kind))
 
   let tree_of_commit_sha t sha =
     let%lwt c = get_commit t sha in
-    get_tree t (Git.Hash.of_tree c.Git.Commit.tree)
+    get_tree t (GitStore.Value.Commit.tree c)
 
   let get repo =
     GitStore.create ~root:(local_mirror repo) ()
@@ -92,22 +131,22 @@ module RepoGit = struct
   let get_file t sha path =
     let rec follow_path path sha = match path with
       | [] -> (match%lwt GitStore.read t sha with
-          | Some (Git.Value.Blob b) -> Lwt.return (Some (Git.Blob.to_raw b))
+          | Ok (GitStore.Value.Blob b) -> Lwt.return (Some (GitStore.Value.Blob.to_string b))
           | _ -> Lwt.return None)
       | dir :: path -> (match%lwt GitStore.read t sha with
-          | Some (Git.Value.Tree tr) ->
+          | Ok (GitStore.Value.Tree tr) ->
             let en_opt =
               OpamStd.Option.of_Not_found
-                (List.find (fun en -> en.Git.Tree.name = dir)) tr
+                (List.find (fun en -> en.GitStore.Value.Tree.name = dir)) (GitStore.Value.Tree.to_list tr)
             in
             (match en_opt with
-             | Some en -> follow_path path en.Git.Tree.node
+             | Some en -> follow_path path en.GitStore.Value.Tree.node
              | None -> Lwt.return None)
           | _ -> Lwt.return None)
     in
     let%lwt c = get_commit t sha in
     follow_path (OpamStd.String.split path '/')
-      (Git.Hash.of_tree c.Git.Commit.tree)
+      (GitStore.Value.Commit.tree c)
 
   let get_file_exn t sha path =
     match%lwt get_file t sha path with
@@ -115,16 +154,37 @@ module RepoGit = struct
     | None -> Lwt.fail Not_found
 
   let branch_reference name =
-    Git.Reference.of_raw ("refs/heads/" ^ name)
+    GitStore.Reference.of_string ("refs/heads/" ^ name)
 
   let get_branch t name =
-    GitStore.read_reference_exn t (branch_reference name)
+    GitStore.Ref.read t (branch_reference name)
 
   let set_branch t name commit_hash =
-    GitStore.write_reference t (branch_reference name) commit_hash
+    GitStore.Ref.write t (branch_reference name) commit_hash
 
   let fetch t repo =
-    GitSync.fetch t ~unpack:true (github_repo repo)
+    let repository = github_repo repo in
+    let host = match Uri.host repository with
+      | Some host -> host
+      | None -> assert false
+    in
+
+    GitNegociation.find_common t >>= fun (has, state, continue) ->
+
+    let continue { GitSyncHttp.Decoder.acks; shallow; unshallow } state =
+      continue { Git.Negociator.acks; shallow; unshallow } state
+    in
+
+    let want refs =
+      assert false
+    in
+
+    GitSyncHttp.fetch t
+      ~https:true
+      ?port:(Uri.port repository)
+      ~negociate:(continue, state)
+      ~has ~want
+      host (Uri.path_and_query repository)
 
   let fetch_pr pull_request t =
     let%lwt _ = fetch t pull_request.base.repo in
@@ -137,11 +197,11 @@ module RepoGit = struct
     let dir = Sys.getcwd () in
     let cmd = [|
       "git"; "push"; (* "--force"; *)
-      Git.Gri.to_string (github_repo repo);
-      Git.Hash.to_hex hash ^":refs/heads/"^ branch;
+      Uri.to_string (github_repo repo);
+      GitStore.Hash.to_hex hash ^":refs/heads/"^ branch;
     |] in
     log "Calling out to git: %s" (String.concat " " (Array.to_list cmd));
-    Sys.chdir (local_mirror repo);
+    Sys.chdir (Fpath.to_string (local_mirror repo));
     match%lwt
       (OpamSystem.write ".git/HEAD" "ref: refs/heads/master";
        Lwt_process.exec ("git", cmd))
@@ -165,13 +225,13 @@ module RepoGit = struct
   let common_ancestor pull_request t =
     log "Looking up common ancestor...";
     let seen = Hashtbl.create 137 in
-    let module S = Git.Hash.Set in
+    let module S = GitStore.Hash.Set in
     let (++), (--), (%%) = S.union, S.diff, S.inter in
     let all_parents s =
       Lwt_list.fold_left_s (fun acc sha ->
           try Lwt.return (acc ++ Hashtbl.find seen sha) with Not_found ->
             let%lwt c = get_commit t sha in
-            let p = S.of_list Git.(List.map Hash.of_commit c.Commit.parents) in
+            let p = S.of_list (GitStore.Value.Commit.parents c) in
             Hashtbl.add seen sha p;
             Lwt.return (acc ++ p))
         S.empty (S.elements s)
@@ -199,8 +259,8 @@ module RepoGit = struct
       all_common descendents' current'
         (descendents ++ current) (current -- descendents)
     in
-    let base = S.singleton (Git_unix.Hash_IO.of_hex pull_request.base.sha) in
-    let head = S.singleton (Git_unix.Hash_IO.of_hex pull_request.head.sha) in
+    let base = S.singleton (GitStore.Hash.of_hex pull_request.base.sha) in
+    let head = S.singleton (GitStore.Hash.of_hex pull_request.head.sha) in
     let%lwt common = all_common base base head head in
     let rec remove_older ancestors = fun s ->
       if S.is_empty s || S.is_empty ancestors ||
@@ -212,42 +272,42 @@ module RepoGit = struct
     in
     let%lwt found = remove_older common common in
     log "found: %s"
-      (OpamStd.List.concat_map " " Git.Hash.to_hex (S.elements found));
+      (OpamStd.List.concat_map " " GitStore.Hash.to_hex (S.elements found));
     Lwt.return (S.choose found)
 
   let changed_files_tree base_tree head_tree t =
     let tree_to_map path t =
       List.fold_left (fun m e ->
-          M.add (path ^ "/" ^ e.Git.Tree.name) e.Git.Tree.node m)
+          M.add (path ^ "/" ^ e.GitStore.Value.Tree.name) e.GitStore.Value.Tree.node m)
         M.empty t
     in
     let rec changed_new acc path left_tree right_tree =
       let left_map = tree_to_map path left_tree in
-      let rec read acc = function
+      let rec read acc tr = match tr with
         | [] -> Lwt.return acc
-        | { Git.Tree.name; node; _ } :: right_tree ->
+        | { GitStore.Value.Tree.name; node; _ } :: right_tree ->
           let path = path ^ "/" ^ name in
           let%lwt right = GitStore.read_exn t node in
           let%lwt left_opt =
             try GitStore.read t (M.find path left_map)
-            with Not_found -> Lwt.return None
+            with Not_found -> Lwt.return (Error `Not_found)
           in
-          if left_opt = Some right then read acc right_tree
+          if left_opt = Ok right then read acc right_tree
           else match right with
-            | Git.Value.Blob b ->
-              read (M.add path (Git.Blob.to_raw b) acc) right_tree
-            | Git.Value.Tree right_subtree ->
+            | GitStore.Value.Blob b ->
+              read (M.add path (GitStore.Value.Blob.to_string b) acc) right_tree
+            | GitStore.Value.Tree right_subtree ->
               let left_subtree =
                 match left_opt with
-                | Some (Git.Value.Tree t) -> t
+                | Ok (GitStore.Value.Tree t) -> GitStore.Value.Tree.to_list t
                 | _ -> []
               in
               let%lwt acc = changed_new acc path left_subtree right_subtree in
               read acc right_tree
-            | Git.Value.Tag _ | Git.Value.Commit _ ->
+            | GitStore.Value.Tag _ | GitStore.Value.Commit _ ->
               Lwt.fail (Failure "Corrupted git state")
       in
-      read acc right_tree
+      read acc (GitStore.Value.Tree.to_list right_tree)
     in
     let%lwt diff = changed_new M.empty "" base_tree head_tree in
     Lwt.return (M.bindings diff)
@@ -255,19 +315,19 @@ module RepoGit = struct
   let changed_files base head t =
     let%lwt base_tree = tree_of_commit_sha t base in
     let%lwt head_tree = tree_of_commit_sha t head in
-    changed_files_tree base_tree head_tree t
+    changed_files_tree (GitStore.Value.Tree.to_list base_tree) head_tree t
 
   let opam_files t sha =
     let rec find_opams acc path sha =
       match%lwt GitStore.read t sha with
-      | None | Some (Git.Value.Commit _) | Some (Git.Value.Tag _) ->
+      | Error _ | Ok (GitStore.Value.Commit _) | Ok (GitStore.Value.Tag _) ->
         Lwt.return acc
-      | Some (Git.Value.Tree dir) ->
+      | Ok (GitStore.Value.Tree dir) ->
         Lwt_list.fold_left_s
           (fun acc entry ->
-             find_opams acc (entry.Git.Tree.name :: path) entry.Git.Tree.node)
-          acc dir
-      | Some (Git.Value.Blob b) ->
+             find_opams acc (entry.GitStore.Value.Tree.name :: path) entry.GitStore.Value.Tree.node)
+          acc (GitStore.Value.Tree.to_list dir)
+      | Ok (GitStore.Value.Blob b) ->
         match path with
         | "opam"::_ ->
           let filename =
@@ -276,7 +336,7 @@ module RepoGit = struct
           in
           let opam =
             try Some (OpamFile.OPAM.read_from_string ~filename
-                        (Git.Blob.to_raw b))
+                        (GitStore.Value.Blob.to_string b))
             with _ -> None
           in
           (match opam with
@@ -285,8 +345,8 @@ module RepoGit = struct
         | _ -> Lwt.return acc
     in
     let%lwt root = tree_of_commit_sha t sha in
-    List.find (fun tr -> tr.Git.Tree.name = "packages") root |> fun en ->
-    find_opams [] ["packages"] en.Git.Tree.node
+    List.find (fun tr -> tr.GitStore.Value.Tree.name = "packages") (GitStore.Value.Tree.to_list root) |> fun en ->
+    find_opams [] ["packages"] en.GitStore.Value.Tree.node
 
 end
 

@@ -2,6 +2,7 @@ B .
 PKG lwt lwt.ppx
 PKG git
 PKG git-unix
+PKG git-http
 PKG github-unix
 PKG opam-core
 PKG opam-format
