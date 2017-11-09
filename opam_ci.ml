@@ -160,25 +160,30 @@ module RepoGit = struct
     GitStore.Ref.read t (branch_reference name)
 
   let set_branch t name commit_hash =
-    GitStore.Ref.write t (branch_reference name) commit_hash
+    GitStore.Ref.write t (branch_reference name)
+      (GitStore.Reference.Hash commit_hash)
 
-  let fetch t repo =
+  let fetch t ?branch repo =
     let repository = github_repo repo in
     let host = match Uri.host repository with
       | Some host -> host
       | None -> assert false
     in
-
-    GitNegociation.find_common t >>= fun (has, state, continue) ->
-
+    let%lwt has, state, continue = GitNegociation.find_common t in
     let continue { GitSyncHttp.Decoder.acks; shallow; unshallow } state =
       continue { Git.Negociator.acks; shallow; unshallow } state
     in
-
     let want refs =
-      assert false
+      match branch with
+      | None ->
+        Lwt.return
+          (List.map (fun (h, name, _bool) -> branch_reference name, h) refs)
+      | Some b ->
+        try
+          let hash, _, _ = List.find (fun (h, name, _) -> name = b) refs in
+          Lwt.return [branch_reference b, hash]
+        with Not_found -> Lwt.fail (Failure "Branch not found")
     in
-
     GitSyncHttp.fetch t
       ~https:true
       ?port:(Uri.port repository)
@@ -553,6 +558,8 @@ module FormatUpgrade = struct
       upgraded_packages
       files
 
+  module S = RepoGit.GitStore
+
   let rec add_file_to_tree gitstore tree path contents =
     let git_compare a b =
       let la = String.length a in
@@ -570,37 +577,50 @@ module FormatUpgrade = struct
     let rec add_to_tree entry = function
       | [] -> [entry]
       | e :: tree ->
-        let cmp = git_compare e.Git.Tree.name entry.Git.Tree.name in
+        let cmp = git_compare e.S.Value.Tree.name entry.S.Value.Tree.name in
         if cmp < 0 then e :: add_to_tree entry tree else
         if cmp > 0 then entry :: e :: tree
         else entry :: tree
     in
+    let add_to_tree entry t =
+      S.Value.Tree.of_list (add_to_tree entry (S.Value.Tree.to_list tree))
+    in
     match path with
     | [] -> Lwt.fail (Failure "Empty path")
     | [file] ->
-      let%lwt hash =
-        RepoGit.GitStore.write gitstore
-          (Git.Value.blob (Git.Blob.of_raw contents))
-      in
-      let entry = { Git.Tree.perm = `Normal; name = file; node = hash } in
-      Lwt.return (add_to_tree entry tree)
+      (match%lwt
+         S.write gitstore
+           (S.Value.blob (S.Value.Blob.of_string contents))
+       with
+       | Ok (hash, i) ->
+         let entry = { S.Value.Tree.perm = `Normal; name = file; node = hash } in
+         Lwt.return (add_to_tree entry tree)
+       | Error s -> Lwt.fail (Failure "Could not write new blob to git"))
     | dir::path ->
       let subtree =
         try
           Some (List.find
-                  (fun e -> e.Git.Tree.name = dir && e.Git.Tree.perm = `Dir)
-                  tree).Git.Tree.node
+                  (fun e ->
+                     e.S.Value.Tree.name = dir && e.S.Value.Tree.perm = `Dir)
+                  (S.Value.Tree.to_list tree)).S.Value.Tree.node
         with Not_found -> None
       in
       let%lwt subtree =
         match subtree with
         | Some h -> RepoGit.get_tree gitstore h
-        | None -> Lwt.return []
+        | None -> Lwt.return (S.Value.Tree.of_list [])
       in
       let%lwt subtree = add_file_to_tree gitstore subtree path contents in
-      let%lwt hash = RepoGit.GitStore.write gitstore (Git.Value.tree subtree) in
-      let entry = { Git.Tree.perm = `Dir; name = dir; node = hash } in
-      Lwt.return (add_to_tree entry tree)
+      match%lwt S.write gitstore (S.Value.tree subtree) with
+      | Ok (hash, _) ->
+        let entry = { S.Value.Tree.perm = `Dir; name = dir; node = hash } in
+        Lwt.return (add_to_tree entry tree)
+      | Error e -> Lwt.fail (Failure "Could not write new subtree")
+
+  let get ?(msg="git error") x =
+    match%lwt x with
+    | Error _ -> Lwt.fail (Failure msg)
+    | Ok (x, _) -> Lwt.return x
 
   let gen_upgrade_commit changed_files head onto gitstore author message =
     let%lwt replace_files = get_updated_subtree head gitstore changed_files in
@@ -611,17 +631,20 @@ module FormatUpgrade = struct
           add_file_to_tree gitstore tree path contents)
         onto_tree (OpamStd.String.Map.bindings replace_files)
     in
-    let%lwt hash = RepoGit.GitStore.write gitstore (Git.Value.tree new_tree) in
-    let commit =
-      { Git.Commit.
-        tree = Git.Hash.to_tree hash;
-        parents = [Git.Hash.to_commit onto; Git.Hash.to_commit head];
-        author = author;
-        committer = git_identity ();
-        message = message;
-      }
+    let%lwt hash =
+      get ~msg:"Could not write upgraded tree" @@
+      S.write gitstore (S.Value.tree new_tree)
     in
-    RepoGit.GitStore.write gitstore (Git.Value.commit commit)
+    let commit =
+      S.Value.Commit.make
+        ~author
+        ~committer:(git_identity ())
+        ~parents:[onto; head]
+        ~tree:hash
+        message
+    in
+    get ~msg:"Could not write upgrade commit" @@
+    S.write gitstore (S.Value.commit commit)
 
   (** We have conflicts if [onto] was changed in the meantime, i.e. the rewrite
       of [ancestor] doesn't match what we have at the current [onto]. This is
@@ -640,18 +663,22 @@ module FormatUpgrade = struct
     is_changed (OpamStd.String.Map.bindings rewritten_ancestor_tree)
 
   let run ancestor_s head_s gitstore repo =
-    let ancestor = Git_unix.Hash_IO.of_hex ancestor_s in
-    let head = Git_unix.Hash_IO.of_hex head_s in
-    let%lwt fetch = RepoGit.fetch gitstore repo in
-    log "Fetched new commits";
-    let remote_onto =
-      Git.Reference.Map.find (RepoGit.branch_reference onto_branch)
-        (Git.Sync.Result.references fetch)
-    in
-    let%lwt () = RepoGit.set_branch gitstore onto_branch remote_onto in
+    let ancestor = S.Hash.of_hex ancestor_s in
+    let head = S.Hash.of_hex head_s in
+    match%lwt RepoGit.fetch gitstore ~branch:onto_branch repo with
+    | Error _ -> Lwt.fail (Failure "Could not fetch")
+    | Ok (([] | _::_::_), _) -> Lwt.fail (Failure "Multiple fetch results")
+    | Ok ([_ref, remote_onto], _) ->
+      log "Fetched new commits";
+      let%lwt _ =
+        RepoGit.set_branch gitstore onto_branch remote_onto
+      in
     log "Updated branch";
     try%lwt
-      let%lwt onto_head = RepoGit.get_branch gitstore onto_branch in
+      let%lwt onto_head =
+        get @@ RepoGit.get_branch gitstore onto_branch >|=
+        S.Reference.to_string
+      in
       let%lwt head_commit = RepoGit.get_commit gitstore head in
       let author = git_identity () in
       let message =
@@ -661,7 +688,7 @@ module FormatUpgrade = struct
           OpamVersion.(to_string (full ()))
       in
       log "Rewriting commit %s (and possible parents) by %s"
-        head_s head_commit.Git.Commit.author.Git.User.name;
+        head_s (S.Value.Commit.author head_commit).Git.User.name;
       let%lwt changed_files = RepoGit.changed_files ancestor head gitstore in
       let%lwt commit_hash =
         gen_upgrade_commit changed_files head onto_head gitstore author message
@@ -673,11 +700,9 @@ module FormatUpgrade = struct
         if has_conflicts then "camelus-"^(String.sub head_s 0 8)
         else onto_branch
       in
-      let%lwt () =
-        RepoGit.set_branch gitstore dest_branch commit_hash
-      in
+      let%lwt _ = RepoGit.set_branch gitstore dest_branch commit_hash in
       log "Pushing new commit %s onto %s (there are %sconflicts)"
-        (Git.Hash.to_hex commit_hash) dest_branch
+        (S.Hash.to_hex commit_hash) dest_branch
         (if has_conflicts then "" else "no ");
       let%lwt () = RepoGit.push gitstore commit_hash dest_branch repo in
       log "Upgrade done";
@@ -740,7 +765,7 @@ module PrChecks = struct
     in
     let title =
       Printf.sprintf "%s <small>%s</small>\n\n"
-        title (Git.Hash.to_hex head)
+        title (RepoGit.GitStore.Hash.to_hex head)
     in
     let pkgname (f,_,_) =
       OpamStd.Option.Op.(
@@ -801,7 +826,8 @@ module PrChecks = struct
 
   let installable gitstore sha =
     let%lwt opams = RepoGit.opam_files gitstore sha in
-    log "opam files at %s: %d" (Git.Hash.to_hex sha) (List.length opams);
+    log "opam files at %s: %d" (RepoGit.GitStore.Hash.to_hex sha)
+      (List.length opams);
     let open OpamTypes in
     let m =
       List.fold_left (fun m o ->
@@ -921,7 +947,7 @@ module PrChecks = struct
 
   let run pr gitstore =
     let%lwt () = RepoGit.fetch_pr pr gitstore in
-    let head = Git_unix.Hash_IO.of_hex pr.head.sha in
+    let head = RepoGit.GitStore.Hash.of_hex pr.head.sha in
     let%lwt ancestor = RepoGit.common_ancestor pr gitstore in
     let%lwt (stlint,msglint) = lint ancestor head gitstore in
     try%lwt
@@ -1292,7 +1318,9 @@ let () =
     Lwt.return (event_push (Some event))
   in
   Lwt_main.run (Lwt.join [
-      RepoGit.get conf.Conf.repo >>= check_loop;
+      (match%lwt RepoGit.get conf.Conf.repo with
+       | Ok r -> check_loop r
+       | Error e -> Lwt.fail (Failure "Repository loading failed"));
       Webhook_handler.server
         ~port:conf.Conf.port
         ~secret:conf.Conf.secret
