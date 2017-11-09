@@ -81,7 +81,11 @@ struct
 
       Cohttp_lwt_unix.Client.call ?headers ?body ~chunked:false meth uri >>= fun (resp, body) ->
       Lwt.return { resp; body; }
-    end else Lwt.return { resp; body = snd v; }
+    end else begin
+      Cohttp_lwt_body.to_string (snd v) >>= fun b ->
+      Printf.eprintf "BODY: %S" b;
+      Lwt.return { resp; body = snd v; }
+    end
 end
 
 module RepoGit = struct
@@ -163,7 +167,7 @@ module RepoGit = struct
     GitStore.Ref.write t (branch_reference name)
       (GitStore.Reference.Hash commit_hash)
 
-  let fetch t ?branch repo =
+  let fetch t ?(branches=[]) repo =
     let repository = github_repo repo in
     let host = match Uri.host repository with
       | Some host -> host
@@ -174,15 +178,17 @@ module RepoGit = struct
       continue { Git.Negociator.acks; shallow; unshallow } state
     in
     let want refs =
-      match branch with
-      | None ->
+      match branches with
+      | [] ->
         Lwt.return
           (List.map (fun (h, name, _bool) -> branch_reference name, h) refs)
-      | Some b ->
-        try
-          let hash, _, _ = List.find (fun (h, name, _) -> name = b) refs in
-          Lwt.return [branch_reference b, hash]
-        with Not_found -> Lwt.fail (Failure "Branch not found")
+      | bs ->
+        let bs = List.map branch_reference bs in
+        List.filter (fun (_, name, _) ->
+            List.exists GitStore.Reference.(equal (of_string name)) bs)
+          refs |>
+        List.map (fun (h, name, _) -> GitStore.Reference.of_string name, h) |>
+        Lwt.return
     in
     GitSyncHttp.fetch t
       ~https:true
@@ -617,9 +623,9 @@ module FormatUpgrade = struct
         Lwt.return (add_to_tree entry tree)
       | Error e -> Lwt.fail (Failure "Could not write new subtree")
 
-  let get ?(msg="git error") x =
+  let get ~err x =
     match%lwt x with
-    | Error _ -> Lwt.fail (Failure msg)
+    | Error e -> Lwt.fail (Failure (Fmt.strf "%a" err e))
     | Ok (x, _) -> Lwt.return x
 
   let gen_upgrade_commit changed_files head onto gitstore author message =
@@ -632,7 +638,7 @@ module FormatUpgrade = struct
         onto_tree (OpamStd.String.Map.bindings replace_files)
     in
     let%lwt hash =
-      get ~msg:"Could not write upgraded tree" @@
+      get ~err:S.pp_error @@
       S.write gitstore (S.Value.tree new_tree)
     in
     let commit =
@@ -643,7 +649,7 @@ module FormatUpgrade = struct
         ~tree:hash
         message
     in
-    get ~msg:"Could not write upgrade commit" @@
+    get ~err:S.pp_error @@
     S.write gitstore (S.Value.commit commit)
 
   (** We have conflicts if [onto] was changed in the meantime, i.e. the rewrite
@@ -665,18 +671,22 @@ module FormatUpgrade = struct
   let run ancestor_s head_s gitstore repo =
     let ancestor = S.Hash.of_hex ancestor_s in
     let head = S.Hash.of_hex head_s in
-    match%lwt RepoGit.fetch gitstore ~branch:onto_branch repo with
-    | Error _ -> Lwt.fail (Failure "Could not fetch")
-    | Ok (([] | _::_::_), _) -> Lwt.fail (Failure "Multiple fetch results")
-    | Ok ([_ref, remote_onto], _) ->
-      log "Fetched new commits";
-      let%lwt _ =
-        RepoGit.set_branch gitstore onto_branch remote_onto
-      in
+    let%lwt refs =
+      get ~err:RepoGit.GitSyncHttp.pp_error
+        (RepoGit.fetch ~branches:[onto_branch; head_s]  gitstore repo)
+    in
+    let%lwt remote_onto =
+      try Lwt.return (List.assoc (RepoGit.branch_reference onto_branch) refs)
+      with Not_found -> Lwt.fail (Failure ("Branch "^onto_branch^" not found"))
+    in
+    log "Fetched new commits";
+    let%lwt _ =
+      RepoGit.set_branch gitstore onto_branch remote_onto
+    in
     log "Updated branch";
     try%lwt
       let%lwt onto_head =
-        get @@ RepoGit.get_branch gitstore onto_branch >|=
+        get ~err:S.Ref.pp_error @@ RepoGit.get_branch gitstore onto_branch >|=
         S.Reference.to_string
       in
       let%lwt head_commit = RepoGit.get_commit gitstore head in
@@ -1234,8 +1244,8 @@ module Conf = struct
 end
 
 let () =
-  (* Logs.set_reporter (Logs.format_reporter ());
-   * Logs.set_level (Some Logs.Debug); *)
+  Logs.set_reporter (Logs.format_reporter ());
+  Logs.set_level (Some Logs.Debug);
   let conf =
     let f = OpamFile.make (OpamFilename.of_string "opam-ci.conf") in
     try Conf.read f with _ ->
