@@ -3,6 +3,7 @@ PKG lwt lwt.ppx
 PKG git
 PKG git-unix
 PKG git-http
+PKG git-cohttp-lwt-unix
 PKG github-unix
 PKG opam-core
 PKG opam-format

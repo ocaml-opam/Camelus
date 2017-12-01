@@ -46,52 +46,11 @@ type push_event = {
   push_ancestor: string;
 }
 
-module CohttpClient =
-struct
-  type headers = Cohttp.Header.t
-  type resp = Git_http.Web_cohttp_lwt.resp =
-    { resp : Cohttp.Response.t
-    ; body : Cohttp_lwt.Body.t }
-  type body = unit -> (Cstruct.t * int * int) option Lwt.t
-  type meth = Cohttp.Code.meth
-  type uri = Uri.t
-
-  type +'a io = 'a Lwt.t
-
-  let call ?headers ?body meth uri =
-    let open Lwt.Infix in
-
-    let body = match body with
-      | None -> None
-      | Some stream ->
-        Lwt_stream.from stream
-        |> Lwt_stream.map (fun (buf, off, len) -> Cstruct.to_string (Cstruct.sub buf off len))
-        |> fun stream -> Some (`Stream stream)
-    in
-
-    Cohttp_lwt_unix.Client.call ?headers ?body ~chunked:false meth uri >>= fun ((resp, _) as v) ->
-    if Cohttp.Code.is_redirection (Cohttp.Code.code_of_status (Cohttp.Response.status resp))
-    then begin
-      let uri =
-        Cohttp.Response.headers resp
-        |> Cohttp.Header.to_list
-        |> List.assoc "location"
-        |> Uri.of_string
-      in
-
-      Cohttp_lwt_unix.Client.call ?headers ?body ~chunked:false meth uri >>= fun (resp, body) ->
-      Lwt.return { resp; body; }
-    end else begin
-      Cohttp_lwt_body.to_string (snd v) >>= fun b ->
-      Printf.eprintf "BODY: %S" b;
-      Lwt.return { resp; body = snd v; }
-    end
-end
-
 module RepoGit = struct
 
   module GitStore = Git_unix.Store
-  module GitSyncHttp = Git_http.Make(Git_http.Default)(CohttpClient)(GitStore)
+  module GitSyncHttp = Git_cohttp_lwt_unix.Make(Git_http.Default)(GitStore)
+(* Git_http.Make(Git_http.Default)(Git_cohttp_lwt_unix.CohttpClient)(GitStore) *)
   module GitNegociation = Git.Negociator.Make(Git_unix.Store)
   module M = OpamStd.String.Map
 
@@ -160,8 +119,13 @@ module RepoGit = struct
   let branch_reference name =
     GitStore.Reference.of_string ("refs/heads/" ^ name)
 
-  let get_branch t name =
-    GitStore.Ref.read t (branch_reference name)
+  let rec get_ref t ref =
+    GitStore.Ref.read t ref >>= function
+    | Error e -> Lwt.fail (Failure (Fmt.strf "%a" GitStore.Ref.pp_error e))
+    | Ok (_, GitStore.Reference.Hash h) -> Lwt.return h
+    | Ok (_, GitStore.Reference.Ref r) -> get_ref t r
+
+  let get_branch t name = get_ref t (branch_reference name)
 
   let set_branch t name commit_hash =
     GitStore.Ref.write t (branch_reference name)
@@ -363,6 +327,7 @@ end
 
 module FormatUpgrade = struct
 
+  let base_branch = "master"
   let onto_branch = "2.0.0"
 
   let git_identity () = {
@@ -671,9 +636,12 @@ module FormatUpgrade = struct
   let run ancestor_s head_s gitstore repo =
     let ancestor = S.Hash.of_hex ancestor_s in
     let head = S.Hash.of_hex head_s in
+    log "Format upgrade: %s at %s upon %s" base_branch head_s ancestor_s;
     let%lwt refs =
       get ~err:RepoGit.GitSyncHttp.pp_error
-        (RepoGit.fetch ~branches:[onto_branch; head_s]  gitstore repo)
+        (RepoGit.fetch
+           ~branches:[base_branch; onto_branch]
+           gitstore repo)
     in
     let%lwt remote_onto =
       try Lwt.return (List.assoc (RepoGit.branch_reference onto_branch) refs)
@@ -685,10 +653,7 @@ module FormatUpgrade = struct
     in
     log "Updated branch";
     try%lwt
-      let%lwt onto_head =
-        get ~err:S.Ref.pp_error @@ RepoGit.get_branch gitstore onto_branch >|=
-        S.Reference.to_string
-      in
+      let%lwt onto_head = RepoGit.get_branch gitstore onto_branch in
       let%lwt head_commit = RepoGit.get_commit gitstore head in
       let author = git_identity () in
       let message =
@@ -1128,12 +1093,13 @@ module Webhook_handler = struct
       name = r -.- "name" |> to_string;
       auth = None;
     } in
-    match ref with
-    | "refs/heads/master" ->
+    if RepoGit.GitStore.Reference.equal
+        (RepoGit.GitStore.Reference.of_string ref)
+        (RepoGit.branch_reference FormatUpgrade.base_branch)
+    then
       Some { push_head; push_ancestor; push_repo }
-    | ref ->
-      log "Ignoring push to %s" ref;
-      None
+    else
+      (log "Ignoring push to %s" ref; None)
 
   let server ~port ~secret ~handler =
     let callback (conn, _) req body =
