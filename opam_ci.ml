@@ -49,7 +49,7 @@ type push_event = {
 module RepoGit = struct
 
   module GitStore = Git_unix.Store
-  module GitSyncHttp = Git_cohttp_lwt_unix.Make(Git_http.Default)(GitStore)
+  module GitSyncHttp = Git_unix.HTTP(GitStore)
 (* Git_http.Make(Git_http.Default)(Git_cohttp_lwt_unix.CohttpClient)(GitStore) *)
   module GitNegociation = Git.Negociator.Make(Git_unix.Store)
   module M = OpamStd.String.Map
@@ -636,7 +636,7 @@ module FormatUpgrade = struct
   let run ancestor_s head_s gitstore repo =
     let ancestor = S.Hash.of_hex ancestor_s in
     let head = S.Hash.of_hex head_s in
-    log "Format upgrade: %s at %s upon %s" base_branch head_s ancestor_s;
+    log "Format upgrade: %s to %s" base_branch onto_branch;
     let%lwt refs =
       get ~err:RepoGit.GitSyncHttp.pp_error
         (RepoGit.fetch
@@ -1103,7 +1103,7 @@ module Webhook_handler = struct
 
   let server ~port ~secret ~handler =
     let callback (conn, _) req body =
-      let%lwt body = Cohttp_lwt_body.to_string body in
+      let%lwt body = Cohttp_lwt.Body.to_string body in
       if not (check_github ~secret req body) then
         (log "Ignored invalid request:\n%s"
            (OpamStd.Format.itemize (fun s -> s)
@@ -1126,9 +1126,9 @@ module Webhook_handler = struct
           (match pull_request_of_json json with
            | Some pr ->
              let%lwt () = handler (`Pr pr) in
-             Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
+             Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
            | None ->
-             Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
+             Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
            | exception Not_found ->
              log "Error: could not get PR data from JSON:\n%s"
                (Yojson.Safe.to_string json);
@@ -1137,16 +1137,16 @@ module Webhook_handler = struct
           (match push_event_of_json json with
            | Some push ->
              let%lwt () = handler (`Push push) in
-             Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
+             Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
            | None ->
-             Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
+             Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
            | exception Not_found ->
              log "Error: could not get push event data from JSON:\n%s"
                (Yojson.Safe.to_string json);
              Server.respond_error ~body:"Invalid format" ())
         | Some a ->
           log "Ignored %s event" a;
-          Server.respond ~status:`OK ~body:Cohttp_lwt_body.empty ()
+          Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
         | None ->
           Server.respond_error ~body:"Invalid format" ()
     in
@@ -1211,7 +1211,7 @@ end
 
 let () =
   Logs.set_reporter (Logs.format_reporter ());
-  Logs.set_level (Some Logs.Debug);
+  Logs.set_level (Some Logs.Info);
   let conf =
     let f = OpamFile.make (OpamFilename.of_string "opam-ci.conf") in
     try Conf.read f with _ ->
