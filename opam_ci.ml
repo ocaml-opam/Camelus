@@ -169,33 +169,33 @@ module RepoGit = struct
     Lwt.return_unit
 
   let push t hash branch repo =
-    let dir = Sys.getcwd () in
-    let cmd = [|
-      "git"; "push"; (* "--force"; *)
-      Uri.to_string (github_repo repo);
-      GitStore.Hash.to_hex hash ^":refs/heads/"^ branch;
-    |] in
-    log "Calling out to git: %s" (String.concat " " (Array.to_list cmd));
-    Sys.chdir (Fpath.to_string (local_mirror repo));
     match%lwt
-      (OpamSystem.write ".git/HEAD" "ref: refs/heads/master";
-       Lwt_process.exec ("git", cmd))
-        [%lwt.finally Sys.chdir dir; Lwt.return_unit]
+      GitSyncHttp.update t ~reference:(branch_reference branch)
+        (github_repo repo)
     with
-    | Unix.WEXITED 0 -> Lwt.return_unit
-    | _ ->
-      log "ERROR: could not push to %s." branch;
+    | Ok _ -> Lwt.return_unit
+    | Error _ ->
+      log "ERROR: could not push to %s" branch;
       Lwt.return_unit
 
-(*
-    match%lwt
-      GitSync.push t ~branch:(branch_reference branch) (github_repo repo)
-    with
-    | { Git.Sync.Result.result = `Ok; _ } -> Lwt.return_unit
-    | { Git.Sync.Result.result = `Error s; _ } ->
-      log "ERROR: could not push to %s: %s" branch s;
-      Lwt.return_unit
-*)
+    (* let dir = Sys.getcwd () in
+     * let cmd = [|
+     *   "git"; "push"; (\* "--force"; *\)
+     *   Uri.to_string (github_repo repo);
+     *   GitStore.Hash.to_hex hash ^":refs/heads/"^ branch;
+     * |] in
+     * log "Calling out to git: %s" (String.concat " " (Array.to_list cmd));
+     * Sys.chdir (Fpath.to_string (local_mirror repo));
+     * match%lwt
+     *   (OpamSystem.write ".git/HEAD" "ref: refs/heads/master";
+     *    Lwt_process.exec ("git", cmd))
+     *     [%lwt.finally Sys.chdir dir; Lwt.return_unit]
+     * with
+     * | Unix.WEXITED 0 -> Lwt.return_unit
+     * | _ ->
+     *   log "ERROR: could not push to %s." branch;
+     *   Lwt.return_unit *)
+
 
   let common_ancestor pull_request t =
     log "Looking up common ancestor...";
