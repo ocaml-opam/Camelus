@@ -7,19 +7,28 @@ homepage: "https://github.com/AltGr/Camelus"
 bug-reports: "https://github.com/AltGr/Camelus/issues"
 dev-repo: "git+https://github.com/AltGr/Camelus.git"
 depends: [
-  "yojson" {= "1.4.0"}
-  "opam-format" {= "2.0.0~beta5"}
-  "cohttp-lwt-unix" {= "0.99.0"}
-  "opam-solver" {= "2.0.0~beta5"}
-  "opam-state" {= "2.0.0~beta5"}
-  "git-unix" {= "1.11.2"}
-  "github-unix" {= "3.0.1"}
+  "cohttp-lwt-unix"
+  "opam-format" {>= "2.0.0~beta5"}
+  "opam-solver" {>= "2.0.0~beta5"}
+  "opam-state" {>= "2.0.0~beta5"}
+  "git-unix" {>= "1.11" & < "2.0"}
+  "github-unix"
+  "yojson"
 ]
 build: make
 name: "opam-ci"
 pin-depends: [
-  ["opam-state.2.0.0~beta5" "git+https://github.com/ocaml/opam#master"]
-  ["opam-solver.2.0.0~beta5" "git+https://github.com/ocaml/opam#master"]
-  ["opam-repository.2.0.0~beta5" "git+https://github.com/ocaml/opam#master"]
-  ["opam-core.2.0.0~beta5" "git+https://github.com/ocaml/opam#master"]
+  ["git-unix.1.11.2" "git+https://github.com/mirage/ocaml-git.git#master"]
+  ["github.3.0.1" "git+https://github.com/rgrinberg/ocaml-github.git"]
+  ["git-http.1.11.2" "git+https://github.com/mirage/ocaml-git.git#master"]
+  ["git.1.11.2" "git+https://github.com/mirage/ocaml-git.git#master"]
+  ["digestif.0.5.0" "git+https://github.com/mirage/digestif.git#link"]
+  [
+    "angstrom.0.7.0"
+    "git+https://github.com/dinosaure/angstrom.git#fix-peek-char"
+  ]
+  [
+    "ocamlfind.1.7.3"
+    "http://download.camlcity.org/download/findlib-1.7.3.tar.gz"
+  ]
 ]

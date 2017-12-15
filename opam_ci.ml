@@ -48,10 +48,10 @@ type push_event = {
 
 module RepoGit = struct
 
-  module GitStore = Git_unix.Store
+  module GitStore = Git_unix.FS
   module GitSyncHttp = Git_unix.HTTP(GitStore)
 (* Git_http.Make(Git_http.Default)(Git_cohttp_lwt_unix.CohttpClient)(GitStore) *)
-  module GitNegociation = Git.Negociator.Make(Git_unix.Store)
+  module GitNegociation = Git.Negociator.Make(GitStore)
   module M = OpamStd.String.Map
 
   let github_repo repo =
@@ -128,74 +128,118 @@ module RepoGit = struct
   let get_branch t name = get_ref t (branch_reference name)
 
   let set_branch t name commit_hash =
+    log "WRITING: %s => %s" name (GitStore.Hash.to_hex commit_hash);
     GitStore.Ref.write t (branch_reference name)
       (GitStore.Reference.Hash commit_hash)
 
   let fetch t ?(branches=[]) repo =
     let repository = github_repo repo in
-    let host = match Uri.host repository with
-      | Some host -> host
-      | None -> assert false
+    (* let host = match Uri.host repository with
+     *   | Some host -> host
+     *   | None -> assert false
+     * in
+     * let%lwt has, state, continue = GitNegociation.find_common t in
+     * let continue { GitSyncHttp.Decoder.acks; shallow; unshallow } state =
+     *   continue { Git.Negociator.acks; shallow; unshallow } state
+     * in
+     * let want refs =
+     *   match branches with
+     *   | [] ->
+     *     Lwt.return
+     *       (List.map (fun (h, name, _bool) -> branch_reference name, h) refs)
+     *   | bs ->
+     *     let bs = List.map branch_reference bs in
+     *     List.filter (fun (_, name, _) ->
+     *         List.exists GitStore.Reference.(equal (of_string name)) bs)
+     *       refs |>
+     *     List.map (fun (h, name, _) -> GitStore.Reference.of_string name, h) |>
+     *     Lwt.return
+     * in *)
+    (* GitSyncHttp.fetch_some t ~references:() repository *)
+    let references =
+      List.fold_left (fun acc b ->
+          let b = branch_reference b in GitStore.Reference.Map.add b [b] acc)
+        GitStore.Reference.Map.empty branches
     in
-    let%lwt has, state, continue = GitNegociation.find_common t in
-    let continue { GitSyncHttp.Decoder.acks; shallow; unshallow } state =
-      continue { Git.Negociator.acks; shallow; unshallow } state
-    in
-    let want refs =
-      match branches with
-      | [] ->
-        Lwt.return
-          (List.map (fun (h, name, _bool) -> branch_reference name, h) refs)
-      | bs ->
-        let bs = List.map branch_reference bs in
-        List.filter (fun (_, name, _) ->
-            List.exists GitStore.Reference.(equal (of_string name)) bs)
-          refs |>
-        List.map (fun (h, name, _) -> GitStore.Reference.of_string name, h) |>
-        Lwt.return
-    in
-    GitSyncHttp.fetch t
-      ~https:true
-      ?port:(Uri.port repository)
-      ~negociate:(continue, state)
-      ~has ~want
-      host (Uri.path_and_query repository)
+    GitSyncHttp.fetch_some ~references t repository >>= function
+    | Ok (hashes, _refs) ->
+      log "FETCHED: %s"
+        (GitStore.Reference.Map.fold (fun ref h acc ->
+             Printf.sprintf "%s%s -> %s\n         " acc
+               (GitStore.Reference.to_string ref)
+               (GitStore.Hash.to_hex h))
+            hashes "");
+      Lwt_list.map_s
+        (fun b ->
+           let%lwt hash, found =
+             try
+               (GitStore.Reference.Map.find (branch_reference b) hashes, true)
+               |> Lwt.return
+             with Not_found ->
+               get_branch t b >|= fun h -> h, false
+           in
+           log "FETCH: %s -> %s (found %b)"
+             b (GitStore.Hash.to_hex hash) found;
+           Lwt.return hash)
+        branches
+    | Error e ->
+      Lwt.fail (Failure (Fmt.strf "%a" GitSyncHttp.pp_error e))
+
+  (* GitSyncHttp.fetch t
+     *   ~https:true
+     *   ?port:(Uri.port repository)
+     *   ~negociate:(continue, state)
+     *   ~has ~want
+     *   host (Uri.path_and_query repository) *)
 
   let fetch_pr pull_request t =
-    let%lwt _ = fetch t pull_request.base.repo in
+    let%lwt _ =
+      fetch t ~branches:[pull_request.base.ref] pull_request.base.repo
+    in
     log "fetched upstream";
-    let%lwt _head_fetch = fetch t pull_request.head.repo in
+    let%lwt _head_fetch =
+      fetch t ~branches:[pull_request.head.ref] pull_request.head.repo
+    in
     log "fetched user repo";
     Lwt.return_unit
 
-  let push t hash branch repo =
+  let push t branch repo =
+    let b = branch_reference branch in
+    let references =
+      GitStore.Reference.Map.singleton b [b]
+    in
+    let%lwt hash = get_ref t b in
+    log "PUSH %s (%s) to %s" (GitStore.Reference.to_string b)
+      (GitStore.Hash.to_hex hash)
+      (Uri.to_string (github_repo repo));
     match%lwt
-      GitSyncHttp.update t ~reference:(branch_reference branch)
+      GitSyncHttp.update_and_create t ~references
         (github_repo repo)
     with
     | Ok _ -> Lwt.return_unit
-    | Error _ ->
-      log "ERROR: could not push to %s" branch;
+    | Error e ->
+      log "ERROR: could not push to %s: %s" branch
+        (Fmt.strf "%a" GitSyncHttp.pp_error e);
       Lwt.return_unit
-
-    (* let dir = Sys.getcwd () in
-     * let cmd = [|
-     *   "git"; "push"; (\* "--force"; *\)
-     *   Uri.to_string (github_repo repo);
-     *   GitStore.Hash.to_hex hash ^":refs/heads/"^ branch;
-     * |] in
-     * log "Calling out to git: %s" (String.concat " " (Array.to_list cmd));
-     * Sys.chdir (Fpath.to_string (local_mirror repo));
-     * match%lwt
-     *   (OpamSystem.write ".git/HEAD" "ref: refs/heads/master";
-     *    Lwt_process.exec ("git", cmd))
-     *     [%lwt.finally Sys.chdir dir; Lwt.return_unit]
-     * with
-     * | Unix.WEXITED 0 -> Lwt.return_unit
-     * | _ ->
-     *   log "ERROR: could not push to %s." branch;
-     *   Lwt.return_unit *)
-
+(*
+    let dir = Sys.getcwd () in
+    let cmd = [|
+      "git"; "push"; (* "--force"; *)
+      Uri.to_string (github_repo repo);
+      "refs/heads/"^ branch;
+    |] in
+    log "Calling out to git: %s" (String.concat " " (Array.to_list cmd));
+    Sys.chdir (Fpath.to_string (local_mirror repo));
+    match%lwt
+      (OpamSystem.write ".git/HEAD" "ref: refs/heads/master";
+       Lwt_process.exec ("git", cmd))
+        [%lwt.finally Sys.chdir dir; Lwt.return_unit]
+    with
+    | Unix.WEXITED 0 -> Lwt.return_unit
+    | _ ->
+      log "ERROR: could not push to %s." branch;
+      Lwt.return_unit
+*)
 
   let common_ancestor pull_request t =
     log "Looking up common ancestor...";
@@ -467,6 +511,7 @@ module FormatUpgrade = struct
     let filename = bname^".comp" in
     let%lwt comp_str = RepoGit.get_file_exn gitstore commit filename in
     let%lwt descr_str = RepoGit.get_file gitstore commit (bname^".descr") in
+    prerr_endline "GC RC";
     let comp =
       OpamFile.Comp.read_from_string
         ~filename:(OpamFile.make (OpamFilename.of_string filename))
@@ -476,11 +521,16 @@ module FormatUpgrade = struct
       OpamStd.Option.map OpamFile.Descr.read_from_string descr_str
     in
     let opam =
-      CompilerConversion.opam_of_comp comp_name comp descr |>
-      OpamFile.OPAM.with_name_opt None |>
-      OpamFile.OPAM.with_version_opt None
+      CompilerConversion.opam_of_comp comp_name comp descr
     in
-    let opam_str = OpamFile.OPAM.write_to_string opam ^"\n" in
+    let opam_str =
+      OpamFile.OPAM.write_to_string
+        (opam
+         |> OpamFile.OPAM.with_name_opt None
+         |> OpamFile.OPAM.with_version_opt None)
+      ^"\n"
+    in
+    prerr_endline "GC RC";
     Lwt.return (OpamFile.OPAM.package opam, opam_str)
 
   let get_updated_subtree commit gitstore changed_files =
@@ -506,7 +556,9 @@ module FormatUpgrade = struct
     in
     let%lwt compiler_packages =
       Lwt_list.fold_left_s (fun acc comp_name ->
+          prerr_endline ("GET_COMP "^comp_name);
           let%lwt nv, opam = get_compiler_opam commit gitstore comp_name in
+          prerr_endline "GET_COMP OK";
           Lwt.return (OpamPackage.Map.add nv opam acc))
         OpamPackage.Map.empty
         (OpamStd.String.Set.elements compilers)
@@ -593,9 +645,13 @@ module FormatUpgrade = struct
     | Error e -> Lwt.fail (Failure (Fmt.strf "%a" err e))
     | Ok (x, _) -> Lwt.return x
 
-  let gen_upgrade_commit changed_files head onto gitstore author message =
+  let gen_upgrade_commit
+      ~merge changed_files head onto gitstore author message =
     let%lwt replace_files = get_updated_subtree head gitstore changed_files in
-    let%lwt onto_tree = RepoGit.tree_of_commit_sha gitstore onto in
+    let%lwt onto_tree =
+      RepoGit.tree_of_commit_sha gitstore
+        (if merge then onto else head)
+    in
     let%lwt new_tree =
       Lwt_list.fold_left_s (fun tree (path,contents) ->
           let path = OpamStd.String.split path '/' in
@@ -606,11 +662,12 @@ module FormatUpgrade = struct
       get ~err:S.pp_error @@
       S.write gitstore (S.Value.tree new_tree)
     in
+    let parents = if merge then [onto; head] else [head] in
     let commit =
       S.Value.Commit.make
         ~author
         ~committer:(git_identity ())
-        ~parents:[onto; head]
+        ~parents
         ~tree:hash
         message
     in
@@ -637,49 +694,73 @@ module FormatUpgrade = struct
     let ancestor = S.Hash.of_hex ancestor_s in
     let head = S.Hash.of_hex head_s in
     log "Format upgrade: %s to %s" base_branch onto_branch;
-    let%lwt refs =
-      get ~err:RepoGit.GitSyncHttp.pp_error
-        (RepoGit.fetch
-           ~branches:[base_branch; onto_branch]
-           gitstore repo)
+    let%lwt head_hash, onto_hash =
+      match%lwt
+        RepoGit.fetch
+          ~branches:[base_branch; onto_branch]
+          gitstore repo
+      with
+      | [head_hash; onto_hash] -> Lwt.return (head_hash, onto_hash)
+      | _ -> Lwt.fail (Failure "Branch fetch failed")
     in
-    let%lwt remote_onto =
-      try Lwt.return (List.assoc (RepoGit.branch_reference onto_branch) refs)
-      with Not_found -> Lwt.fail (Failure ("Branch "^onto_branch^" not found"))
-    in
-    log "Fetched new commits";
-    let%lwt _ =
-      RepoGit.set_branch gitstore onto_branch remote_onto
-    in
-    log "Updated branch";
+    assert (head = head_hash);
+    log "RO";
+    (* let%lwt remote_onto =
+     *   try Lwt.return (List.assoc (RepoGit.branch_reference onto_branch) refs)
+     *   with Not_found -> Lwt.fail (Failure ("Branch "^onto_branch^" not found"))
+     * in *)
+    (* let%lwt remote_onto =
+     *   RepoGit.get_branch gitstore ("origin/"^onto_branch)
+     * in *)
+    log "Fetched new commits: head %s onto %s"
+      (RepoGit.GitStore.Hash.to_hex head_hash)
+      (RepoGit.GitStore.Hash.to_hex onto_hash);
+    (* let%lwt _ =
+     *   RepoGit.set_branch gitstore onto_branch remote_onto
+     * in
+     * log "Updated branch"; *)
     try%lwt
-      let%lwt onto_head = RepoGit.get_branch gitstore onto_branch in
-      let%lwt head_commit = RepoGit.get_commit gitstore head in
+      let%lwt onto_head = RepoGit.get_commit gitstore onto_hash in
+      let%lwt head_commit = RepoGit.get_commit gitstore head_hash in
       let author = git_identity () in
-      let message =
-        Printf.sprintf
-          "Merge changes from 1.2 format repo\n\n\
-           Merge done by Camelus based on opam-lib %s"
-          OpamVersion.(to_string (full ()))
-      in
       log "Rewriting commit %s (and possible parents) by %s"
         head_s (S.Value.Commit.author head_commit).Git.User.name;
       let%lwt changed_files = RepoGit.changed_files ancestor head gitstore in
-      let%lwt commit_hash =
-        gen_upgrade_commit changed_files head onto_head gitstore author message
-      in
+      log "HC";
       let%lwt has_conflicts =
-        check_for_conflicts changed_files ancestor onto_head gitstore
+        check_for_conflicts changed_files ancestor onto_hash gitstore
       in
+      log "CH";
+      let message =
+        if has_conflicts then
+          Printf.sprintf
+            "Partial update from 1.2 format repo\n\n\
+             Update done by Camelus based on opam-lib %s\n\
+             There were conflicts with changes on the current %s branch, so \
+             this is left unmerged."
+            OpamVersion.(to_string (full ()))
+            onto_branch
+        else
+          Printf.sprintf
+            "Update from 1.2 format repo\n\n\
+             Merge done by Camelus based on opam-lib %s"
+            OpamVersion.(to_string (full ()))
+      in
+      let%lwt commit_hash =
+        gen_upgrade_commit ~merge:(not has_conflicts)
+          changed_files head onto_hash gitstore author message
+      in
+      log "DB";
       let dest_branch =
         if has_conflicts then "camelus-"^(String.sub head_s 0 8)
         else onto_branch
       in
+      log "SB";
       let%lwt _ = RepoGit.set_branch gitstore dest_branch commit_hash in
       log "Pushing new commit %s onto %s (there are %sconflicts)"
         (S.Hash.to_hex commit_hash) dest_branch
         (if has_conflicts then "" else "no ");
-      let%lwt () = RepoGit.push gitstore commit_hash dest_branch repo in
+      let%lwt () = RepoGit.push gitstore dest_branch repo in
       log "Upgrade done";
       Lwt.return (if has_conflicts then Some dest_branch else None)
     with e ->
@@ -1210,8 +1291,7 @@ module Conf = struct
 end
 
 let () =
-  Logs.set_reporter (Logs.format_reporter ());
-  Logs.set_level (Some Logs.Info);
+  Logs.(set_reporter (format_reporter ()); set_level (Some Debug));
   let conf =
     let f = OpamFile.make (OpamFilename.of_string "opam-ci.conf") in
     try Conf.read f with _ ->
