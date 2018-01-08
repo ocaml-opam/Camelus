@@ -180,6 +180,21 @@ module RepoGit = struct
         with _ -> Lwt.return acc)
       []
 
+  (* returns a list (rel_filename * contents) *)
+  let extra_files t sha package =
+    let ( / ) a b = a ^ "/" ^ b in
+    let dir =
+      "packages" /
+      OpamPackage.name_to_string package /
+      OpamPackage.to_string package /
+      "files"
+    in
+    git t ["ls-files"; dir]
+    >|= (fun s -> OpamStd.String.split s '\n')
+    >>= Lwt_list.map_s (fun f ->
+        let%lwt contents = get_file_exn t sha f in
+        Lwt.return (OpamStd.String.remove_prefix ~prefix:dir f, contents))
+
 end
 
 module Git = struct
@@ -230,6 +245,14 @@ module FormatUpgrade = struct
         OpamFile.OPAM.with_url (OpamFile.URL.read_from_string u) opam
     in
     let opam = OpamFormatUpgrade.opam_file ~quiet:true opam in
+    let%lwt extra_files =
+      RepoGit.extra_files gitstore commit nv >>=
+      Lwt_list.map_s (fun (f, contents) ->
+          Lwt.return
+            (OpamFilename.Base.of_string f,
+             OpamHash.compute_from_string contents))
+    in
+    let opam = OpamFile.OPAM.with_extra_files extra_files opam in
     let opam_str =
       OpamFile.OPAM.to_string_with_preserved_format
         ~format_from_string:opam_str
