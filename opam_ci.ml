@@ -357,7 +357,6 @@ module FormatUpgrade = struct
     let filename = bname^".comp" in
     let%lwt comp_str = RepoGit.get_file_exn gitstore commit filename in
     let%lwt descr_str = RepoGit.get_file gitstore commit (bname^".descr") in
-    prerr_endline "GC RC";
     let comp =
       OpamFile.Comp.read_from_string
         ~filename:(OpamFile.make (OpamFilename.of_string filename))
@@ -376,7 +375,6 @@ module FormatUpgrade = struct
          |> OpamFile.OPAM.with_version_opt None)
       ^"\n"
     in
-    prerr_endline "GC RC";
     Lwt.return (OpamFile.OPAM.package opam, opam_str)
 
   let get_updated_subtree commit gitstore changed_files =
@@ -400,17 +398,13 @@ module FormatUpgrade = struct
          OpamStd.String.Map.empty)
         changed_files
     in
-    log "GCP";
     let%lwt compiler_packages =
       Lwt_list.fold_left_s (fun acc comp_name ->
-          prerr_endline ("GET_COMP "^comp_name);
           let%lwt nv, opam = get_compiler_opam commit gitstore comp_name in
-          prerr_endline "GET_COMP OK";
           Lwt.return (OpamPackage.Map.add nv opam acc))
         OpamPackage.Map.empty
         (OpamStd.String.Set.elements compilers)
     in
-    log "GUP";
     let%lwt upgraded_packages =
       Lwt_list.fold_left_s (fun acc nv ->
           try%lwt
@@ -420,7 +414,6 @@ module FormatUpgrade = struct
         compiler_packages
         (OpamPackage.Set.elements packages)
     in
-    log "GRT: %s" (OpamPackage.Set.to_string (OpamPackage.keys upgraded_packages));
     Lwt.return @@
     (OpamPackage.keys upgraded_packages,
      OpamPackage.Map.fold (fun nv opam acc ->
@@ -524,7 +517,6 @@ module FormatUpgrade = struct
     let%lwt _packages, rewritten_ancestor_tree =
       get_updated_subtree ancestor gitstore changed_files
     in
-    log "CFC";
     let rec changed = function
       | (path, contents) :: r ->
         (match%lwt RepoGit.get_file gitstore onto path with
@@ -550,7 +542,6 @@ module FormatUpgrade = struct
       | _ -> Lwt.fail (Failure "Branch fetch failed")
     in
     (* assert (head = head_hash); *)
-    log "RO";
     (* let%lwt remote_onto =
      *   try Lwt.return (List.assoc (RepoGit.branch_reference onto_branch) refs)
      *   with Not_found -> Lwt.fail (Failure ("Branch "^onto_branch^" not found"))
@@ -572,11 +563,9 @@ module FormatUpgrade = struct
       let%lwt changed_files =
         RepoGit.changed_files ancestor head_hash gitstore
       in
-      log "HC: %s" (OpamStd.List.concat_map " " fst changed_files);
       let%lwt conflicts =
         check_for_conflicts changed_files ancestor onto_hash gitstore
       in
-      log "CH";
       let message packages =
         if conflicts <> [] then
           Printf.sprintf
@@ -599,12 +588,10 @@ module FormatUpgrade = struct
         gen_upgrade_commit ~merge:(conflicts = [])
           changed_files head_hash onto_hash gitstore author message
       in
-      log "DB";
       let dest_branch =
         if conflicts <> [] then "camelus-"^(String.sub head_hash 0 8)
         else onto_branch
       in
-      log "SB";
       let%lwt _ = RepoGit.set_branch gitstore dest_branch commit_hash in
       log "Pushing new commit %s onto %s (there are %sconflicts)"
         ((* S.Hash.to_hex  *)commit_hash) dest_branch
