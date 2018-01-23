@@ -187,7 +187,7 @@ module RepoGit = struct
       "packages" /
       OpamPackage.name_to_string package /
       OpamPackage.to_string package /
-      "files"
+      "files" / ""
     in
     git t ["ls-files"; dir]
     >|= (fun s -> OpamStd.String.split s '\n')
