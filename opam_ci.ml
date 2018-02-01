@@ -191,6 +191,8 @@ module RepoGit = struct
     in
     git t ["ls-files"; dir]
     >|= (fun s -> OpamStd.String.split s '\n')
+    >|= List.sort compare
+    >|= List.rev
     >>= Lwt_list.map_s (fun f ->
         let%lwt contents = get_file_exn t sha f in
         Lwt.return (OpamStd.String.remove_prefix ~prefix:dir f, contents))
