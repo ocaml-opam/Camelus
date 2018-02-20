@@ -351,7 +351,7 @@ module FormatUpgrade = struct
 
   let get_compiler_opam commit gitstore comp_name =
     let bname =
-      Printf.sprintf "/compilers/%s/%s/%s"
+      Printf.sprintf "compilers/%s/%s/%s"
         (match OpamStd.String.cut_at comp_name '+'
          with Some (v,_) -> v | None -> comp_name)
         comp_name comp_name
