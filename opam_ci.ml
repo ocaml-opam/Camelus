@@ -156,7 +156,8 @@ module RepoGit = struct
     Lwt.return_unit
 
   let push t branch repo =
-    git t ["push"; Uri.to_string (github_repo repo); branch_reference branch ^":"^ branch]
+    git t ["push"; Uri.to_string (github_repo repo);
+           branch_reference branch ^":"^ branch]
     >|= ignore
 
   let common_ancestor pull_request t =
@@ -210,9 +211,6 @@ module Git = struct
 end
 
 module FormatUpgrade = struct
-
-  let base_branch = "master"
-  let onto_branch = "2.0.0"
 
   let git_identity () = {
     Git.User.
@@ -569,7 +567,7 @@ module FormatUpgrade = struct
     in
     changed (OpamStd.String.Map.bindings rewritten_ancestor_tree)
 
-  let run ancestor head_hash gitstore repo =
+  let run base_branch onto_branch ancestor head_hash gitstore repo =
     log "Format upgrade: %s to %s" base_branch onto_branch;
     let%lwt _head_hash, onto_hash =
       match%lwt
@@ -645,7 +643,7 @@ module FormatUpgrade = struct
       Lwt.return None
 
 end
-(*
+
 module PrChecks = struct
 
   let pkg_to_string p = Printf.sprintf "`%s`" (OpamPackage.to_string p)
@@ -655,9 +653,13 @@ module PrChecks = struct
   let lint ancestor head gitstore =
     let%lwt files = RepoGit.changed_files ancestor head gitstore in
     let opam_files =
-      List.filter (fun (s,_) ->
-          OpamStd.String.starts_with ~prefix:"/packages/" s &&
-          OpamStd.String.ends_with ~suffix:"/opam" s)
+      OpamStd.List.filter_map (fun (s,c) ->
+          match c with
+          | Some c when
+              OpamStd.String.starts_with ~prefix:"/packages/" s &&
+              OpamStd.String.ends_with ~suffix:"/opam" s
+            -> Some (s, c)
+          | _ -> None)
         files
     in
     let lint =
@@ -695,8 +697,7 @@ module PrChecks = struct
         "##### :white_check_mark: No new or changed opam files"
     in
     let title =
-      Printf.sprintf "%s <small>%s</small>\n\n"
-        title (RepoGit.GitStore.Hash.to_hex head)
+      Printf.sprintf "%s <small>%s</small>\n\n" title head
     in
     let pkgname (f,_,_) =
       OpamStd.Option.Op.(
@@ -757,8 +758,7 @@ module PrChecks = struct
 
   let installable gitstore sha =
     let%lwt opams = RepoGit.opam_files gitstore sha in
-    log "opam files at %s: %d" (RepoGit.GitStore.Hash.to_hex sha)
-      (List.length opams);
+    log "opam files at %s: %d" sha (List.length opams);
     let open OpamTypes in
     let m =
       List.fold_left (fun m o ->
@@ -878,7 +878,7 @@ module PrChecks = struct
 
   let run pr gitstore =
     let%lwt () = RepoGit.fetch_pr pr gitstore in
-    let head = RepoGit.GitStore.Hash.of_hex pr.head.sha in
+    let head = pr.head.sha in
     let%lwt ancestor = RepoGit.common_ancestor pr gitstore in
     let%lwt (stlint,msglint) = lint ancestor head gitstore in
     try%lwt
@@ -890,7 +890,7 @@ module PrChecks = struct
           (Printexc.get_backtrace ());
         Lwt.return (stlint, msglint)
 
-end*)
+end
 
 module Github_comment = struct
 
@@ -1038,7 +1038,7 @@ module Webhook_handler = struct
       log "Ignoring %s PR action" a;
       None
 
-  let push_event_of_json json =
+  let push_event_of_json base_branch json =
     let open JS in
     let ref = json -.- "ref" |> to_string in
     let push_head = json -.- "after" |> to_string  in
@@ -1051,13 +1051,13 @@ module Webhook_handler = struct
     } in
     if (* RepoGit.GitStore.Reference.equal *)
         ((* RepoGit.GitStore.Reference.of_string *) ref) =
-        (RepoGit.branch_reference FormatUpgrade.base_branch)
+        (RepoGit.branch_reference base_branch)
     then
       Some { push_head; push_ancestor; push_repo }
     else
       (log "Ignoring push to %s" ref; None)
 
-  let server ~port ~secret ~handler =
+  let server ~port ~secret ~handler base_branch dest_branch =
     let callback (conn, _) req body =
       let%lwt body = Cohttp_lwt.Body.to_string body in
       if not (check_github ~secret req body) then
@@ -1090,7 +1090,7 @@ module Webhook_handler = struct
                (Yojson.Safe.to_string json);
              Server.respond_error ~body:"Invalid format" ())
         | Some "push" ->
-          (match push_event_of_json json with
+          (match push_event_of_json base_branch json with
            | Some push ->
              let%lwt () = handler (`Push push) in
              Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
@@ -1124,6 +1124,8 @@ module Conf = struct
       secret: Cstruct.t;
       repo: repo;
       roles: [ `Pr_checker | `Push_upgrader ] list;
+      base_branch: string;
+      dest_branch: string;
     }
 
     let empty = {
@@ -1133,9 +1135,20 @@ module Conf = struct
       secret = Cstruct.of_string "";
       repo = { user="ocaml"; name="opam-repository"; auth=None };
       roles = [ `Pr_checker ];
+      base_branch = "master";
+      dest_branch = "2.0.0";
     }
 
     open OpamPp.Op
+
+    let role_of_string = function
+      | "pr_checker" -> `Pr_checker
+      | "push_upgrader" -> `Push_upgrader
+      | _ -> failwith "Invalid role (accepted are pr_checker, push_upgrader)"
+
+    let role_to_string = function
+      | `Pr_checker -> "pr_checker"
+      | `Push_upgrader -> "push_upgrader"
 
     let fields = [
       "port", OpamPp.ppacc (fun port t -> {t with port}) (fun t -> t.port)
@@ -1157,6 +1170,20 @@ module Conf = struct
         (fun name t -> {t with repo = {t.repo with name}})
         (fun t -> t.repo.name)
         OpamFormat.V.string;
+      "roles", OpamPp.ppacc
+        (fun roles t -> {t with roles })
+        (fun t -> t.roles)
+        (OpamFormat.V.map_list @@
+         OpamFormat.V.ident -|
+         OpamPp.of_pair "role" (role_of_string, role_to_string));
+      "base-branch", OpamPp.ppacc
+        (fun base_branch t -> {t with base_branch })
+        (fun t -> t.base_branch)
+        OpamFormat.V.string;
+      "dest-branch", OpamPp.ppacc
+        (fun dest_branch t -> {t with dest_branch })
+        (fun t -> t.dest_branch)
+        OpamFormat.V.string;
     ]
 
     let pp =
@@ -1171,7 +1198,8 @@ end
 let () =
   Logs.(set_reporter (format_reporter ()); set_level (Some Info));
   let conf =
-    let f = OpamFile.make (OpamFilename.of_string "opam-ci.conf") in
+    let f = if Array.length Sys.argv >= 1 then Sys.argv.(0) else "opam-ci.conf" in
+    let f = OpamFile.make (OpamFilename.of_string f) in
     try Conf.read f with _ ->
       prerr_endline "A file opam-ci.conf with fields `token' and `secret' (and \
                      optionally `name' and `port') is required.";
@@ -1179,55 +1207,59 @@ let () =
   in
   let auth = conf.Conf.name, Github.Token.to_string conf.Conf.token in
   let event_stream, event_push = Lwt_stream.create () in
+  let pr_checker = List.mem `Pr_checker conf.Conf.roles in
+  let push_upgrader = List.mem `Push_upgrader conf.Conf.roles in
   let rec check_loop gitstore =
     (* The checks are done sequentially *)
     let%lwt () =
       try%lwt
         match%lwt Lwt_stream.next event_stream with
-        | `Pr pr ->
+        | `Pr pr when pr_checker ->
           (log "=> PR #%d received \
                 (onto %s/%s#%s from %s/%s#%s, commit %s over %s)"
              pr.number
              pr.base.repo.user pr.base.repo.name pr.base.ref
              pr.head.repo.user pr.head.repo.name pr.head.ref
              pr.head.sha pr.base.sha;
-           (* try%lwt
-            *   let%lwt report = PrChecks.run pr gitstore in
-            *   Github_comment.push_report
-            *     ~name:conf.Conf.name
-            *     ~token:conf.Conf.token
-            *     ~report
-            *     pr
-            * with exn ->
-            *   log "Check failed: %s" (Printexc.to_string exn);
-            *   let%lwt _ =
-            *     Github_comment.push_status
-            *       ~name:conf.Conf.name ~token:conf.Conf.token pr
-            *       ~text:"Could not complete" `Failure
-            *   in *) Lwt.return_unit)
-        | `Push p ->
-          log "=> Push received (head %s onto %s)"
-            p.push_head p.push_ancestor;
-          let%lwt pr_branch =
-            try%lwt
-              FormatUpgrade.run
-                p.push_ancestor p.push_head gitstore
-                { p.push_repo with auth = Some auth }
-            with exn ->
-              log "Upgrade commit failed: %s" (Printexc.to_string exn);
-              Lwt.return None
-          in
-          match pr_branch with
-          | None -> Lwt.return_unit
-          | Some branch ->
-            try%lwt
-              Github_comment.pull_request
-                ~name:conf.Conf.name ~token:conf.Conf.token conf.Conf.repo
-                branch FormatUpgrade.onto_branch
-                "Merge changes from 1.2 format repo"
-            with exn ->
-              log "Pull request failed: %s" (Printexc.to_string exn);
-              Lwt.return_unit
+           try%lwt
+             let%lwt report = PrChecks.run pr gitstore in
+             Github_comment.push_report
+               ~name:conf.Conf.name
+               ~token:conf.Conf.token
+               ~report
+               pr
+           with exn ->
+             log "Check failed: %s" (Printexc.to_string exn);
+             let%lwt _ =
+               Github_comment.push_status
+                 ~name:conf.Conf.name ~token:conf.Conf.token pr
+                 ~text:"Could not complete" `Failure
+             in
+             Lwt.return_unit)
+        | `Push p when push_upgrader ->
+          (log "=> Push received (head %s onto %s)"
+             p.push_head p.push_ancestor;
+           let%lwt pr_branch =
+             try%lwt
+               FormatUpgrade.run conf.Conf.base_branch conf.Conf.dest_branch
+                 p.push_ancestor p.push_head gitstore
+                 { p.push_repo with auth = Some auth }
+             with exn ->
+               log "Upgrade commit failed: %s" (Printexc.to_string exn);
+               Lwt.return None
+           in
+           match pr_branch with
+           | None -> Lwt.return_unit
+           | Some branch ->
+             try%lwt
+               Github_comment.pull_request
+                 ~name:conf.Conf.name ~token:conf.Conf.token conf.Conf.repo
+                 branch conf.Conf.dest_branch
+                 "Merge changes from 1.2 format repo"
+             with exn ->
+               log "Pull request failed: %s" (Printexc.to_string exn);
+               Lwt.return_unit)
+        | _ -> Lwt.return_unit
       with
       | Lwt_stream.Empty -> exit 0
       | exn ->
@@ -1258,5 +1290,7 @@ let () =
       Webhook_handler.server
         ~port:conf.Conf.port
         ~secret:conf.Conf.secret
-        ~handler;
+        ~handler
+        conf.Conf.base_branch
+        conf.Conf.dest_branch;
     ])
