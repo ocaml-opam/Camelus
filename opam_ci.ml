@@ -164,10 +164,10 @@ module RepoGit = struct
     >|= String.trim
 
   let changed_files base head t =
-    git t ["diff-tree"; "-r"; "--name-only"; "--diff-filter=ACMR"; base; head]
+    git t ["diff-tree"; "-r"; "--name-only"; "--diff-filter=ACMRD"; base; head]
     >>= fun s ->
     let paths = OpamStd.String.split s '\n' in
-    Lwt_list.map_s (fun p -> get_file_exn t head p >|= fun c -> p, c) paths
+    Lwt_list.map_s (fun p -> get_file t head p >|= fun c -> p, c) paths
 
   let opam_files t sha =
     git t ["ls-files"; "packages/**/opam"]
@@ -379,25 +379,48 @@ module FormatUpgrade = struct
     in
     Lwt.return (OpamFile.OPAM.package opam, opam_str)
 
+  let pkg_of_comp c =
+    let ocaml_official_pkgname = OpamPackage.Name.of_string "ocaml-base-compiler" in
+    let ocaml_variants_pkgname = OpamPackage.Name.of_string "ocaml-variants" in
+    match OpamStd.String.cut_at c '+' with
+    | None ->
+      OpamPackage.create ocaml_official_pkgname
+        (OpamPackage.Version.of_string c)
+    | Some (version,variant) ->
+      OpamPackage.create ocaml_variants_pkgname
+        (OpamPackage.Version.of_string (version^"+"^variant))
+
   let get_updated_subtree commit gitstore changed_files =
-    let compilers, packages, files =
-      List.fold_left (fun (compilers, packages, files) (f, contents) ->
+    let compilers, packages, files, removed =
+      List.fold_left (fun (compilers, packages, files, removed) (f, contents) ->
           try Scanf.sscanf f "compilers/%_s@/%s@/"
-                (fun s -> OpamStd.String.Set.add s compilers, packages, files)
+                (fun s ->
+                   if contents = None then
+                     compilers, packages, files,
+                     OpamPackage.Set.add (pkg_of_comp s) removed
+                   else
+                     OpamStd.String.Set.add s compilers,
+                     packages, files, removed)
           with Scanf.Scan_failure _ -> try
               Scanf.sscanf f "packages/%_s@/%s@/%s@/"
                 (fun s -> function
+                   | "opam" when contents = None ->
+                     compilers, packages, files,
+                     OpamPackage.Set.add (OpamPackage.of_string s) removed
                    | "opam" | "url" | "descr" ->
                      compilers,
                      OpamPackage.Set.add (OpamPackage.of_string s) packages,
-                     files
+                     files, removed
                    | "files" ->
-                     compilers, packages, OpamStd.String.Map.add f contents files
-                   | _ -> compilers, packages, files)
-            with Scanf.Scan_failure _ -> compilers, packages, files)
+                     compilers, packages,
+                     OpamStd.String.Map.add f contents files,
+                     removed
+                   | _ -> compilers, packages, files, removed)
+            with Scanf.Scan_failure _ -> compilers, packages, files, removed)
         (OpamStd.String.Set.empty,
          OpamPackage.Set.empty,
-         OpamStd.String.Map.empty)
+         OpamStd.String.Map.empty,
+         OpamPackage.Set.empty)
         changed_files
     in
     let%lwt compiler_packages =
@@ -416,17 +439,21 @@ module FormatUpgrade = struct
         compiler_packages
         (OpamPackage.Set.elements packages)
     in
+    let pkg_filename nv =
+      Printf.sprintf "packages/%s/%s/opam"
+        (OpamPackage.name_to_string nv)
+        (OpamPackage.to_string nv)
+    in
     Lwt.return @@
     (OpamPackage.keys upgraded_packages,
-     OpamPackage.Map.fold (fun nv opam acc ->
-         let f =
-           Printf.sprintf "packages/%s/%s/opam"
-             (OpamPackage.name_to_string nv)
-             (OpamPackage.to_string nv)
-         in
-         OpamStd.String.Map.add f opam acc)
-       upgraded_packages
-       files)
+     removed,
+     OpamPackage.Map.fold (fun nv opam ->
+         OpamStd.String.Map.add (pkg_filename nv) (Some opam))
+       upgraded_packages @@
+     OpamPackage.Set.fold (fun nv ->
+         OpamStd.String.Map.add (pkg_filename nv) None)
+       removed @@
+     files)
 
 (*
   let rec add_file_to_tree gitstore tree path contents =
@@ -476,7 +503,7 @@ module FormatUpgrade = struct
 *)
   let gen_upgrade_commit
       ~merge changed_files head onto gitstore author message =
-    let%lwt packages, replace_files =
+    let%lwt packages, removed_packages, replace_files =
       get_updated_subtree head gitstore changed_files
     in
     let%lwt _ =
@@ -485,15 +512,24 @@ module FormatUpgrade = struct
     in
     let%lwt () =
       Lwt_list.iter_s (fun (path, contents) ->
-          let%lwt hash =
-            RepoGit.git gitstore ["hash-object"; "-w"; "--stdin"] ~input:contents
-            >|= String.trim
-          in
-          let%lwt _ =
-            RepoGit.git gitstore
-              ["update-index"; "--ignore-missing"; "--add"; "--cacheinfo"; "100644,"^hash^","^path]
-          in
-          Lwt.return_unit)
+          match contents with
+          | Some contents ->
+            let%lwt hash =
+              RepoGit.git gitstore ["hash-object"; "-w"; "--stdin"] ~input:contents
+              >|= String.trim
+            in
+            let%lwt _ =
+              RepoGit.git gitstore
+                ["update-index"; "--ignore-missing"; "--add";
+                 "--cacheinfo"; "100644,"^hash^","^path]
+            in
+            Lwt.return_unit
+          | None ->
+            let%lwt _ =
+              RepoGit.git gitstore
+                ["update-index"; "--ignore-missing"; "--remove"; "--"; path]
+            in
+            Lwt.return_unit)
         (OpamStd.String.Map.bindings replace_files)
     in
     let%lwt tree = RepoGit.git gitstore ["write-tree"] >|= String.trim in
@@ -516,18 +552,19 @@ module FormatUpgrade = struct
       of [ancestor] doesn't match what we have at the current [onto]. This is
       the case where we don't want to force an overwrite *)
   let check_for_conflicts changed_files ancestor onto gitstore =
-    let%lwt _packages, rewritten_ancestor_tree =
+    let%lwt _packages, _removed, rewritten_ancestor_tree =
       get_updated_subtree ancestor gitstore changed_files
     in
     let rec changed = function
       | (path, contents) :: r ->
-        (match%lwt RepoGit.get_file gitstore onto path with
-         | Some c when c <> contents ->
-           log "Conflict on %s:\n<<<<<<\n%s======\n%s>>>>>>" path
-             contents c;
-           changed r >>= fun acc -> Lwt.return (path::acc)
-         (* | exception Not_found -> is_changed r *)
-         | _ -> changed r)
+        let%lwt c = RepoGit.get_file gitstore onto path in
+        if c <> contents then
+          (log "Conflict on %s:\n<<<<<<\n%s======\n%s>>>>>>" path
+             (OpamStd.Option.to_string (fun s -> s) contents)
+             (OpamStd.Option.to_string (fun s -> s) c);
+           changed r >>= fun acc -> Lwt.return (path::acc))
+        else
+          changed r
       | [] -> Lwt.return []
     in
     changed (OpamStd.String.Map.bindings rewritten_ancestor_tree)
