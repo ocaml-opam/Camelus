@@ -1173,7 +1173,7 @@ module Conf = struct
       "roles", OpamPp.ppacc
         (fun roles t -> {t with roles })
         (fun t -> t.roles)
-        (OpamFormat.V.map_list @@
+        (OpamFormat.V.map_list ~depth:1 @@
          OpamFormat.V.ident -|
          OpamPp.of_pair "role" (role_of_string, role_to_string));
       "base-branch", OpamPp.ppacc
@@ -1198,11 +1198,11 @@ end
 let () =
   Logs.(set_reporter (format_reporter ()); set_level (Some Info));
   let conf =
-    let f = if Array.length Sys.argv >= 1 then Sys.argv.(0) else "opam-ci.conf" in
+    let f = if Array.length Sys.argv > 1 then Sys.argv.(1) else "opam-ci.conf" in
     let f = OpamFile.make (OpamFilename.of_string f) in
-    try Conf.read f with _ ->
-      prerr_endline "A file opam-ci.conf with fields `token' and `secret' (and \
-                     optionally `name' and `port') is required.";
+    try Conf.read f with e ->
+      Printf.eprintf "Invalid conf file %s:\n%s\n"
+        (OpamFile.to_string f) (Printexc.to_string e);
       exit 3
   in
   let auth = conf.Conf.name, Github.Token.to_string conf.Conf.token in
