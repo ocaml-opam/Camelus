@@ -813,7 +813,9 @@ module PrChecks = struct
       u_attrs = [];
       u_reinstall = OpamPackage.Set.empty;
     } in
-    let installable = OpamSolver.installable universe in
+    let%lwt installable =
+      Lwt_preemptive.detach OpamSolver.installable universe
+    in
     log "... of which %d installable" (OpamPackage.Set.cardinal installable);
     Lwt.return (packages, installable)
 
