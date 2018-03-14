@@ -9,3 +9,4 @@ PKG opam-core
 PKG opam-format
 PKG opam-solver
 PKG opam-state
+PKG fpath

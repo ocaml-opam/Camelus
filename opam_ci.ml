@@ -70,7 +70,7 @@ module RepoGit = struct
       OpamStd.List.concat_map " "
         (fun s -> if String.contains s ' ' then Printf.sprintf "%S" s else s)
         (Array.to_list cmd) in
-    log "+ %s" str_cmd;
+    (* log "+ %s" str_cmd; *)
     Sys.chdir (Fpath.to_string (local_mirror repo));
     let env =
       match env with
@@ -782,6 +782,9 @@ module PrChecks = struct
         Some (S (OpamPackage.Version.to_string nv.version))
       | OpamVariable.Full.Global, "opam-version" ->
         Some (S OpamVersion.(to_string current))
+      | OpamVariable.Full.Global, "with-test" -> Some (B false)
+      | OpamVariable.Full.Global, "with-doc" -> Some (B false)
+      | OpamVariable.Full.Global, "dev" -> Some (B false)
       | _ -> None
     in
     let universe = {
