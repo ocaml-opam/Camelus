@@ -1018,12 +1018,16 @@ module Webhook_handler = struct
       | _ -> raise Not_found
   end
 
-  let pull_request_of_json json =
+  let pull_request_of_json base_branch json =
     let open JS in
     match json -.- "action" |> to_string with
     | "opened" | "reopened" | "syncronize" ->
       let number = json -.- "number" |> to_int in
       let pr = json -.- "pull_request" in
+      let base = pr -.- "base" -.- "ref" |> to_string in
+      if base <> RepoGit.branch_reference base_branch then
+        (log "Ignoring PR to %s" base; None)
+      else
       let full_repo r = {
         repo = { user = r -.- "user" -.- "login" |> to_string;
                  name = r -.- "repo" -.- "name" |> to_string;
@@ -1084,7 +1088,7 @@ module Webhook_handler = struct
       | json ->
         match Header.get (Request.headers req) "x-github-event" with
         | Some "pull_request" ->
-          (match pull_request_of_json json with
+          (match pull_request_of_json base_branch json with
            | Some pr ->
              let%lwt () = handler (`Pr pr) in
              Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
