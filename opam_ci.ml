@@ -63,14 +63,14 @@ module RepoGit = struct
   let local_mirror repo =
     Fpath.v (Fmt.strf "./%s%%%s.git" repo.user repo.name)
 
-  let git ?(can_fail=false) ?(verbose=true) repo ?env ?input args =
+  let git ?(can_fail=false) ?(verbose=false) repo ?env ?input args =
     let save_dir = Sys.getcwd () in
     let cmd = Array.of_list ("git" :: args) in
     let str_cmd =
       OpamStd.List.concat_map " "
         (fun s -> if String.contains s ' ' then Printf.sprintf "%S" s else s)
         (Array.to_list cmd) in
-    (* log "+ %s" str_cmd; *)
+    if verbose then log "+ %s" str_cmd;
     Sys.chdir (Fpath.to_string (local_mirror repo));
     let env =
       match env with
