@@ -688,13 +688,13 @@ module PrChecks = struct
     in
     let title =
       if errors <> [] then
-        "##### :x: opam-lint errors"
+        "##### :cloud_with_lightning: opam-lint errors"
       else if warnings <> [] then
-        "##### :exclamation: opam-lint warnings"
+        "##### :sun_behind_small_cloud: opam-lint warnings"
       else if passed <> [] then
-        "##### :white_check_mark: All lint checks passed"
+        "##### :sun_with_face: All lint checks passed"
       else
-        "##### :white_check_mark: No new or changed opam files"
+        "##### :sun_with_face: No new or changed opam files"
     in
     let title =
       Printf.sprintf "%s <small>%s</small>\n\n" title head
@@ -838,7 +838,7 @@ module PrChecks = struct
     let no_breaks = OpamPackage.Set.is_empty breaks in
     let title =
       Printf.sprintf "\n\n##### :%s: Installability check (%d &rarr; %d)\n\n"
-        (if no_breaks then "white_check_mark" else "exclamation")
+        (if no_breaks then "sun_with_face" else "sun_behind_small_cloud")
         (OpamPackage.Set.cardinal installable_before)
         (OpamPackage.Set.cardinal installable_after)
     in
