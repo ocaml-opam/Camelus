@@ -170,9 +170,20 @@ module RepoGit = struct
     let paths = OpamStd.String.split s '\n' in
     Lwt_list.map_s (fun p -> get_file t head p >|= fun c -> p, c) paths
 
+  let opam_file_re =
+    Re.(compile @@ seq [
+        bos;
+        str "packages/";
+        rep1 @@ diff any (char '/');
+        opt @@ seq [char '/'; rep1 @@ diff any (char '/')];
+        str "/opam";
+        eos;
+      ])
+
   let opam_files t sha =
-    git t ["ls-files"; "packages/**/opam"]
+    git t ["ls-tree"; "-r"; "--name-only"; sha; "packages/"]
     >|= (fun s -> OpamStd.String.split s '\n')
+    >|= List.filter (Re.execp opam_file_re)
     >>= Lwt_list.fold_left_s (fun acc f ->
         let filename = OpamFile.make (OpamFilename.of_string f) in
         try%lwt
@@ -190,7 +201,7 @@ module RepoGit = struct
       OpamPackage.to_string package /
       "files" / ""
     in
-    git t ["ls-files"; dir]
+    git t ["ls-tree"; "-r"; "--name-only"; sha; dir]
     >|= (fun s -> OpamStd.String.split s '\n')
     >|= List.sort compare
     >|= List.rev
