@@ -1028,10 +1028,15 @@ module Webhook_handler = struct
       | _ -> log "field %s not found" key; raise Not_found
     let to_string = function
       | `String s -> s
-      | _ -> raise Not_found
+      | `Null -> ""
+      | j ->
+        log "JSON error: not a string %s" (Yojson.Safe.to_string j);
+        raise Not_found
     let to_int = function
       | `Int i -> i
-      | _ -> raise Not_found
+      | j ->
+        log "JSON error: not an int %s" (Yojson.Safe.to_string j);
+        raise Not_found
   end
 
   let pull_request_of_json base_branch json =
@@ -1040,10 +1045,6 @@ module Webhook_handler = struct
     | "opened" | "reopened" | "syncronize" ->
       let number = json -.- "number" |> to_int in
       let pr = json -.- "pull_request" in
-      let base = pr -.- "base" -.- "ref" |> to_string in
-      if base <> RepoGit.branch_reference base_branch then
-        (log "Ignoring PR to %s" base; None)
-      else
       let full_repo r = {
         repo = { user = r -.- "user" -.- "login" |> to_string;
                  name = r -.- "repo" -.- "name" |> to_string;
@@ -1053,6 +1054,9 @@ module Webhook_handler = struct
       } in
       let base = full_repo (pr -.- "base") in
       let head = full_repo (pr -.- "head") in
+      if base.ref <> base_branch then
+        (log "Ignoring PR to %S (!= %S)" base.ref base_branch; None)
+      else
       let pr_user = pr -.- "user" -.- "login" |> to_string in
       let message =
         pr -.- "title" |> to_string,
