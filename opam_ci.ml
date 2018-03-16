@@ -614,6 +614,10 @@ module FormatUpgrade = struct
       let%lwt conflicts =
         check_for_conflicts changed_files ancestor onto_hash gitstore
       in
+      let rec firstn n = if n <= 0 then fun _ -> ["..."] else function
+          | x::r -> x::firstn (n-1) r
+          | [] -> []
+      in
       let message packages =
         if conflicts <> [] then
           Printf.sprintf
@@ -621,7 +625,8 @@ module FormatUpgrade = struct
              Update done by Camelus based on opam-lib %s\n\
              There were conflicts with changes on the current %s branch, so \
              this is left unmerged. Conflicting files:\n%s"
-            (OpamStd.List.concat_map ", " OpamPackage.to_string packages)
+            (String.concat ", "
+               (firstn 5 (List.map OpamPackage.to_string packages)))
             OpamVersion.(to_string (full ()))
             onto_branch
             (OpamStd.Format.itemize (fun s -> s) conflicts)
