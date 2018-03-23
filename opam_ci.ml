@@ -638,7 +638,7 @@ module FormatUpgrade = struct
             OpamVersion.(to_string (full ()))
       in
       let%lwt commit_hash =
-        gen_upgrade_commit ~merge:(conflicts = [])
+        gen_upgrade_commit ~merge:true
           changed_files head_hash onto_hash gitstore author message
       in
       let dest_branch =
