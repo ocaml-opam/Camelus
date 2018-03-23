@@ -1042,7 +1042,7 @@ module Webhook_handler = struct
   let pull_request_of_json base_branch json =
     let open JS in
     match json -.- "action" |> to_string with
-    | "opened" | "reopened" | "syncronize" ->
+    | "opened" | "reopened" | "synchronize" ->
       let number = json -.- "number" |> to_int in
       let pr = json -.- "pull_request" in
       let full_repo r = {
