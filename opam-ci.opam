@@ -12,6 +12,7 @@ depends: [
   "opam-solver" {>= "2.0.0~beta5"}
   "opam-state" {>= "2.0.0~beta5"}
   "git-unix" {>= "1.11" & < "2.0"}
+  "fpath"
   "github-unix"
   "yojson"
 ]

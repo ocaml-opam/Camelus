@@ -628,8 +628,8 @@ module FormatUpgrade = struct
           Printf.sprintf
             "Partial format upgrade (%s)\n\n\
              Update done by Camelus based on opam-lib %s\n\
-             There were conflicts with changes on the current %s branch, so \
-             this is left unmerged. Conflicting files:\n%s"
+             This might overwrite changes done on the current %s branch, so it \
+             was not automatically merged. Conflicting files:\n%s"
             (String.concat ", "
                (firstn 5 (List.map OpamPackage.to_string packages)))
             OpamVersion.(to_string (full ()))
