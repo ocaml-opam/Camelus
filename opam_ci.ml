@@ -549,13 +549,18 @@ module FormatUpgrade = struct
       "GIT_COMMITTER_NAME="^ committer.Git.User.name;
       "GIT_COMMITTER_EMAIL="^ committer.Git.User.email;
     |] in
+    let message =
+      message (OpamPackage.Set.elements
+                 (OpamPackage.Set.union packages removed_packages))
+    in
     RepoGit.git gitstore ~env
       ("commit-tree" ::
-       "-m" :: message (OpamPackage.Set.elements packages) ::
+       "-m" :: message ::
        (if merge then ["-p"; onto] else []) @
        [ "-p"; head;
          tree ])
     >|= String.trim
+    >|= fun hash -> hash, message
 
   (** We have conflicts if [onto] was changed in the meantime, i.e. the rewrite
       of [ancestor] doesn't match what we have at the current [onto]. This is
@@ -637,7 +642,7 @@ module FormatUpgrade = struct
             (OpamStd.List.concat_map ", " OpamPackage.to_string packages)
             OpamVersion.(to_string (full ()))
       in
-      let%lwt commit_hash =
+      let%lwt commit_hash, msg =
         gen_upgrade_commit ~merge:true
           changed_files head_hash onto_hash gitstore author message
       in
@@ -651,7 +656,7 @@ module FormatUpgrade = struct
         (if conflicts <> [] then "" else "no ");
       let%lwt () = RepoGit.push gitstore dest_branch repo in
       log "Upgrade done";
-      Lwt.return (if conflicts <> [] then Some dest_branch else None)
+      Lwt.return (if conflicts <> [] then Some (dest_branch, msg) else None)
     with e ->
       log "Upgrade and push to branch %s failed: %s\n%s" onto_branch
         (Printexc.to_string e)
@@ -1279,12 +1284,17 @@ let () =
            in
            match pr_branch with
            | None -> Lwt.return_unit
-           | Some branch ->
+           | Some (branch, msg) ->
+             let title, message =
+               match OpamStd.String.cut_at msg '\n' with
+               | Some (t, m) -> t, Some (String.trim m)
+               | None -> "Merge changes from 1.2 format repo", None
+             in
              try%lwt
                Github_comment.pull_request
                  ~name:conf.Conf.name ~token:conf.Conf.token conf.Conf.repo
                  branch conf.Conf.dest_branch
-                 "Merge changes from 1.2 format repo"
+                 ?message title
              with exn ->
                log "Pull request failed: %s" (Printexc.to_string exn);
                Lwt.return_unit)
