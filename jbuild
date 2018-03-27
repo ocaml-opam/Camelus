@@ -1,0 +1,19 @@
+(jbuild_version 1)
+
+(library(
+  (name camelus_lib)
+  (public_name camelus)
+  (wrapped false)
+  (modules camelus_lib)
+  (libraries (lwt.unix conduit-lwt cohttp-lwt opam-format opam-solver opam-state cohttp-lwt-unix fpath yojson nocrypto github-unix))
+  (preprocess (pps (lwt.ppx)))
+))
+
+(executable(
+  (name camelus_main)
+  (public_name camelus)
+  (modules camelus_main)
+  (libraries (camelus_lib))
+  (preprocess (pps (lwt.ppx)))
+))
+

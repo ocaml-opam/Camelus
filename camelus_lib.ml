@@ -63,7 +63,9 @@ module RepoGit = struct
   let local_mirror repo =
     Fpath.v (Fmt.strf "./%s%%%s.git" repo.user repo.name)
 
-  let git ?(can_fail=false) ?(verbose=false) repo ?env ?input args =
+  let git
+      ?(can_fail=false) ?(silent_fail=false) ?(verbose=false)
+      repo ?env ?input args =
     let save_dir = Sys.getcwd () in
     let cmd = Array.of_list ("git" :: args) in
     let str_cmd =
@@ -96,7 +98,7 @@ module RepoGit = struct
       match%lwt p#close with
       | Unix.WEXITED 0 -> Lwt.return r
       | Unix.WEXITED i ->
-        log "ERROR: command %s returned %d" str_cmd i;
+        if not silent_fail then log "ERROR: command %s returned %d" str_cmd i;
         if can_fail then Lwt.return r else Lwt.fail (Failure str_cmd)
       | Unix.WSIGNALED _ | Unix.WSTOPPED _ ->
         log "ERROR: command %s interrupted" str_cmd;
@@ -114,7 +116,7 @@ module RepoGit = struct
 
   let get_file t sha path =
     try%lwt
-      git t ~verbose:false ["show"; sha ^":"^ path]
+      git t ~verbose:false ~silent_fail:true ["show"; sha ^":"^ path]
       >|= OpamStd.Option.some
     with Failure _ -> Lwt.return None
 
@@ -141,7 +143,9 @@ module RepoGit = struct
       List.map (fun b -> "+" ^ branch_reference b ^ ":" ^ remote b) branches
     in
     let%lwt _ = git t ("fetch" :: Uri.to_string (github_repo repo) :: b) in
-    Lwt_list.map_s (fun b -> git t ["rev-parse"; remote b] >|= String.trim)
+    Lwt_list.map_s (fun b ->
+        log "fetched %s" b;
+        git t ["rev-parse"; remote b] >|= String.trim)
       branches
 
   let fetch_pr pull_request t =
@@ -155,8 +159,9 @@ module RepoGit = struct
     log "fetched user repo";
     Lwt.return_unit
 
-  let push t branch repo =
+  let push ?(force=false) t branch repo =
     git t ["push"; Uri.to_string (github_repo repo);
+           (if force then "+" else "") ^
            branch_reference branch ^":"^ branch]
     >|= ignore
 
@@ -566,8 +571,14 @@ module FormatUpgrade = struct
       of [ancestor] doesn't match what we have at the current [onto]. This is
       the case where we don't want to force an overwrite *)
   let check_for_conflicts changed_files ancestor onto gitstore =
+    let%lwt changed_files_on_ancestor =
+      Lwt_list.map_s (fun (f, _) ->
+          RepoGit.get_file gitstore ancestor f >|= fun c -> f, c)
+        changed_files
+    in
     let%lwt _packages, _removed, rewritten_ancestor_tree =
-      get_updated_subtree ancestor gitstore changed_files
+      get_updated_subtree ancestor gitstore
+        changed_files_on_ancestor
     in
     let rec changed = function
       | (path, contents) :: r ->
@@ -616,6 +627,7 @@ module FormatUpgrade = struct
       let%lwt changed_files =
         RepoGit.changed_files ancestor head_hash gitstore
       in
+      log "CHANGED FILES(%s %s): %s" ancestor head_hash (OpamStd.List.to_string fst changed_files);
       let%lwt conflicts =
         check_for_conflicts changed_files ancestor onto_hash gitstore
       in
@@ -654,7 +666,9 @@ module FormatUpgrade = struct
       log "Pushing new commit %s onto %s (there are %sconflicts)"
         ((* S.Hash.to_hex  *)commit_hash) dest_branch
         (if conflicts <> [] then "" else "no ");
-      let%lwt () = RepoGit.push gitstore dest_branch repo in
+      let%lwt () =
+        RepoGit.push ~force:(conflicts<>[]) gitstore dest_branch repo
+      in
       log "Upgrade done";
       Lwt.return (if conflicts <> [] then Some (dest_branch, msg) else None)
     with e ->
@@ -986,13 +1000,35 @@ module Github_comment = struct
   let pull_request ~name ~token repo branch target_branch ?message title =
     log "Pull-requesting...";
     let pr () =
-      let pull = {
-        new_pull_title = title;
-        new_pull_body = message;
-        new_pull_base = target_branch;
-        new_pull_head = branch;
-      } in
-      Github.Pull.create ~token ~user:repo.user ~repo:repo.name ~pull ()
+      let rec find_pr stream =
+        Github.Stream.next stream >>= function
+        | Some (pr, s) ->
+          if pr.pull_head.branch_ref = branch &&
+             pr.pull_base.branch_ref = target_branch
+          then return (Some pr)
+          else find_pr s
+        | None -> return None
+      in
+      find_pr (Github.Pull.for_repo
+                 ~token ~state:`Open ~user:repo.user ~repo:repo.name ())
+      >>= function
+      | None ->
+        let pull = {
+          new_pull_title = title;
+          new_pull_body = message;
+          new_pull_base = target_branch;
+          new_pull_head = branch;
+        } in
+        Github.Pull.create ~token ~user:repo.user ~repo:repo.name ~pull ()
+      | Some pr ->
+        let update_pull = {
+          update_pull_title = Some title;
+          update_pull_body = message;
+          update_pull_state = None;
+          update_pull_base = None;
+        } in
+        Github.Pull.update ~token ~user:repo.user ~repo:repo.name
+          ~num:pr.pull_number ~update_pull ()
     in
     run (
       pr () >>= fun resp ->
@@ -1228,108 +1264,3 @@ module Conf = struct
   include C
   include OpamFile.SyntaxFile(C)
 end
-
-let () =
-  Logs.(set_reporter (format_reporter ()); set_level (Some Info));
-  let conf =
-    let f = if Array.length Sys.argv > 1 then Sys.argv.(1) else "opam-ci.conf" in
-    let f = OpamFile.make (OpamFilename.of_string f) in
-    try Conf.read f with e ->
-      Printf.eprintf "Invalid conf file %s:\n%s\n"
-        (OpamFile.to_string f) (Printexc.to_string e);
-      exit 3
-  in
-  let auth = conf.Conf.name, Github.Token.to_string conf.Conf.token in
-  let event_stream, event_push = Lwt_stream.create () in
-  let pr_checker = List.mem `Pr_checker conf.Conf.roles in
-  let push_upgrader = List.mem `Push_upgrader conf.Conf.roles in
-  let rec check_loop gitstore =
-    (* The checks are done sequentially *)
-    let%lwt () =
-      try%lwt
-        match%lwt Lwt_stream.next event_stream with
-        | `Pr pr when pr_checker ->
-          (log "=> PR #%d received \
-                (onto %s/%s#%s from %s/%s#%s, commit %s over %s)"
-             pr.number
-             pr.base.repo.user pr.base.repo.name pr.base.ref
-             pr.head.repo.user pr.head.repo.name pr.head.ref
-             pr.head.sha pr.base.sha;
-           try%lwt
-             let%lwt report = PrChecks.run pr gitstore in
-             Github_comment.push_report
-               ~name:conf.Conf.name
-               ~token:conf.Conf.token
-               ~report
-               pr
-           with exn ->
-             log "Check failed: %s" (Printexc.to_string exn);
-             let%lwt _ =
-               Github_comment.push_status
-                 ~name:conf.Conf.name ~token:conf.Conf.token pr
-                 ~text:"Could not complete" `Failure
-             in
-             Lwt.return_unit)
-        | `Push p when push_upgrader ->
-          (log "=> Push received (head %s onto %s)"
-             p.push_head p.push_ancestor;
-           let%lwt pr_branch =
-             try%lwt
-               FormatUpgrade.run conf.Conf.base_branch conf.Conf.dest_branch
-                 p.push_ancestor p.push_head gitstore
-                 { p.push_repo with auth = Some auth }
-             with exn ->
-               log "Upgrade commit failed: %s" (Printexc.to_string exn);
-               Lwt.return None
-           in
-           match pr_branch with
-           | None -> Lwt.return_unit
-           | Some (branch, msg) ->
-             let title, message =
-               match OpamStd.String.cut_at msg '\n' with
-               | Some (t, m) -> t, Some (String.trim m)
-               | None -> "Merge changes from 1.2 format repo", None
-             in
-             try%lwt
-               Github_comment.pull_request
-                 ~name:conf.Conf.name ~token:conf.Conf.token conf.Conf.repo
-                 branch conf.Conf.dest_branch
-                 ?message title
-             with exn ->
-               log "Pull request failed: %s" (Printexc.to_string exn);
-               Lwt.return_unit)
-        | _ -> Lwt.return_unit
-      with
-      | Lwt_stream.Empty -> exit 0
-      | exn ->
-        log "Event handler failed: %s" (Printexc.to_string exn);
-        Lwt.return_unit
-    in
-    check_loop gitstore
-  in
-  let handler event =
-    let%lwt () =
-      match event with
-      | `Pr pr ->
-        let%lwt _ =
-          Github_comment.push_status
-            ~name:conf.Conf.name ~token:conf.Conf.token pr
-            ~text:"In progress" `Pending
-        in
-        Lwt.return_unit
-      | _ ->
-        Lwt.return_unit
-    in
-    Lwt.return (event_push (Some event))
-  in
-  Lwt_main.run (Lwt.join [
-      (match%lwt RepoGit.get conf.Conf.repo with
-       | Ok r -> check_loop r
-       | Error e -> Lwt.fail (Failure "Repository loading failed"));
-      Webhook_handler.server
-        ~port:conf.Conf.port
-        ~secret:conf.Conf.secret
-        ~handler
-        conf.Conf.base_branch
-        conf.Conf.dest_branch;
-    ])
