@@ -520,6 +520,10 @@ module FormatUpgrade = struct
     let%lwt packages, removed_packages, replace_files =
       get_updated_subtree head gitstore changed_files
     in
+    if OpamPackage.Set.(is_empty packages && is_empty removed_packages) &&
+       OpamStd.String.Map.is_empty replace_files
+    then Lwt.return None
+    else
     let%lwt _ =
       RepoGit.git gitstore
         ["reset"; "-q"; "--mixed"; if merge then onto else head]
@@ -565,7 +569,7 @@ module FormatUpgrade = struct
        [ "-p"; head;
          tree ])
     >|= String.trim
-    >|= fun hash -> hash, message
+    >|= fun hash -> Some (hash, message)
 
   (** We have conflicts if [onto] was changed in the meantime, i.e. the rewrite
       of [ancestor] doesn't match what we have at the current [onto]. This is
@@ -627,7 +631,6 @@ module FormatUpgrade = struct
       let%lwt changed_files =
         RepoGit.changed_files ancestor head_hash gitstore
       in
-      log "CHANGED FILES(%s %s): %s" ancestor head_hash (OpamStd.List.to_string fst changed_files);
       let%lwt conflicts =
         check_for_conflicts changed_files ancestor onto_hash gitstore
       in
@@ -654,23 +657,27 @@ module FormatUpgrade = struct
             (OpamStd.List.concat_map ", " OpamPackage.to_string packages)
             OpamVersion.(to_string (full ()))
       in
-      let%lwt commit_hash, msg =
+      match%lwt
         gen_upgrade_commit ~merge:true
           changed_files head_hash onto_hash gitstore author message
-      in
-      let dest_branch =
-        if conflicts <> [] then "camelus-"^(String.sub head_hash 0 8)
-        else onto_branch
-      in
-      let%lwt _ = RepoGit.set_branch gitstore dest_branch commit_hash in
-      log "Pushing new commit %s onto %s (there are %sconflicts)"
-        ((* S.Hash.to_hex  *)commit_hash) dest_branch
-        (if conflicts <> [] then "" else "no ");
-      let%lwt () =
-        RepoGit.push ~force:(conflicts<>[]) gitstore dest_branch repo
-      in
-      log "Upgrade done";
-      Lwt.return (if conflicts <> [] then Some (dest_branch, msg) else None)
+      with
+      | None ->
+        log "No changes needed to %s branch" onto_branch;
+        Lwt.return None
+      | Some (commit_hash, msg) ->
+        let dest_branch =
+          if conflicts <> [] then "camelus-"^(String.sub head_hash 0 8)
+          else onto_branch
+        in
+        let%lwt _ = RepoGit.set_branch gitstore dest_branch commit_hash in
+        log "Pushing new commit %s onto %s (there are %sconflicts)"
+          ((* S.Hash.to_hex  *)commit_hash) dest_branch
+          (if conflicts <> [] then "" else "no ");
+        let%lwt () =
+          RepoGit.push ~force:(conflicts<>[]) gitstore dest_branch repo
+        in
+        log "Upgrade done";
+        Lwt.return (if conflicts <> [] then Some (dest_branch, msg) else None)
     with e ->
       log "Upgrade and push to branch %s failed: %s\n%s" onto_branch
         (Printexc.to_string e)
