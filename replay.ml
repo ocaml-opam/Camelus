@@ -39,12 +39,12 @@ let replay num =
     | Some _, Some h -> h
     | _ -> failwith "No merge SHA found"
   in
-  let merge_parent_sha = merge_sha^"^2" in
+  let merge_parent_sha = merge_sha^"^" in
     log "Upgrading branch from %s to %s"
       merge_parent_sha merge_sha;
     let%lwt new_branch =
       FormatUpgrade.run base_branch dest_branch
-        p.pull_base.branch_sha merge_sha gitstore
+        merge_parent_sha merge_sha gitstore
         repo
     in
       match new_branch with
@@ -60,4 +60,4 @@ let replay num =
                 branch dest_branch
                 ?message title
 
-let () = Lwt_main.run (replay 11640)
+let () = Lwt_main.run (replay 11570)

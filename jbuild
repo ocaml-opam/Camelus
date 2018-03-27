@@ -13,7 +13,15 @@
   (name camelus_main)
   (public_name camelus)
   (modules camelus_main)
-  (libraries (camelus_lib))
+  (libraries (camelus))
   (preprocess (pps (lwt.ppx)))
 ))
 
+(executable(
+  (name camelus_replay)
+  (public_name camelus-replay)
+  (package camelus)
+  (modules camelus_replay)
+  (libraries (camelus))
+  (preprocess (pps (lwt.ppx)))
+))

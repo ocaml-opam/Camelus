@@ -15,5 +15,7 @@ depends: [
   "fpath"
   "github-unix"
   "yojson"
+  "jbuilder"
+  "tls"
 ]
-build: make
+build: ["jbuilder" "build" "-p" name]
