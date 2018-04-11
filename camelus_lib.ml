@@ -698,7 +698,7 @@ module PrChecks = struct
       OpamStd.List.filter_map (fun (s,c) ->
           match c with
           | Some c when
-              OpamStd.String.starts_with ~prefix:"/packages/" s &&
+              OpamStd.String.starts_with ~prefix:"packages/" s &&
               OpamStd.String.ends_with ~suffix:"/opam" s
             -> Some (s, c)
           | _ -> None)
