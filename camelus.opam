@@ -19,3 +19,7 @@ depends: [
   "tls"
 ]
 build: ["jbuilder" "build" "-p" name]
+pin-depends: [
+  ["github.3.0.1" "git+https://github.com/AltGr/ocaml-github#21efde3"]
+  ["github-unix.3.0.1" "git+https://github.com/AltGr/ocaml-github#21efde3"]
+]
