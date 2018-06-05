@@ -704,14 +704,29 @@ module PrChecks = struct
           | _ -> None)
         files
     in
-    let lint =
-      List.map (fun (file,contents) ->
+    let%lwt lint =
+      Lwt_list.map_s (fun (file,contents) ->
+          let nv =
+            match OpamPackage.of_filename (OpamFilename.of_string file) with
+            | Some nv -> nv
+            | None -> OpamPackage.of_string "invalid-package-name.v"
+          in
+          let%lwt check_extra_files =
+            RepoGit.extra_files gitstore head nv >>=
+            Lwt_list.map_s (fun (f, contents) ->
+                Lwt.return
+                  (OpamFilename.Base.of_string f,
+                   fun h ->
+                     OpamHash.compute_from_string ~kind:(OpamHash.kind h)
+                       contents
+                     = h))
+          in
           let r, opamopt =
-            OpamFileTools.lint_string
+            OpamFileTools.lint_string ~check_extra_files
               (OpamFile.make (OpamFilename.of_string file))
               contents
           in
-          file, r, opamopt)
+          Lwt.return (file, r, opamopt))
         opam_files
     in
     let unwanted_warns = [] in
