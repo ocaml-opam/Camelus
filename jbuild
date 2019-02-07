@@ -6,7 +6,7 @@
   (wrapped false)
   (modules camelus_lib)
   (libraries (lwt.unix conduit-lwt cohttp-lwt opam-format opam-solver opam-state cohttp-lwt-unix fpath yojson nocrypto github-unix))
-  (preprocess (pps (lwt.ppx)))
+  (preprocess (pps (lwt_ppx)))
 ))
 
 (executable(
@@ -14,7 +14,7 @@
   (public_name camelus)
   (modules camelus_main)
   (libraries (camelus))
-  (preprocess (pps (lwt.ppx)))
+  (preprocess (pps (lwt_ppx)))
 ))
 
 (executable(
@@ -23,5 +23,5 @@
   (package camelus)
   (modules camelus_replay)
   (libraries (camelus))
-  (preprocess (pps (lwt.ppx)))
+  (preprocess (pps (lwt_ppx)))
 ))
