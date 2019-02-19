@@ -1,0 +1,35 @@
+(library
+ (name camelus_lib)
+ (public_name camelus)
+ (wrapped false)
+ (modules camelus_lib)
+ (libraries cohttp-lwt
+            cohttp-lwt-unix
+            conduit-lwt
+            fpath
+            github-unix
+            nocrypto
+            opam-format
+            opam-solver
+            opam-state
+            yojson
+            lwt.unix)
+ (preprocess (pps lwt_ppx))
+)
+
+(executable
+ (name camelus_main)
+ (public_name camelus)
+ (modules camelus_main)
+ (libraries camelus)
+ (preprocess (pps lwt_ppx))
+)
+
+(executable
+ (name camelus_replay)
+ (public_name camelus-replay)
+ (package camelus)
+ (modules camelus_replay)
+ (libraries camelus)
+ (preprocess (pps lwt_ppx))
+)

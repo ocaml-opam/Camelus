@@ -20,7 +20,7 @@ depends: [
   ("ago" | ("utop"))
   ("fpath" | "abella")
 ]
-build: ["jbuilder" "build" "-p" name]
+build: ["dune" "build" "-p" name]
 pin-depends: [
   ["github.3.1.0" "git+https://github.com/AltGr/ocaml-github#21efde3"]
   ["github-unix.3.1.0" "git+https://github.com/AltGr/ocaml-github#21efde3"]
