@@ -321,7 +321,7 @@ module FormatUpgrade = struct
             (OpamPackage.Version.of_string (version^"+"^variant))
       in
       let opam =
-        OpamFile.Comp.to_package ~package:nv comp descr |>
+        OpamFormatUpgrade.comp_file ~package:nv ?descr comp |>
         OpamFile.OPAM.with_conflict_class
           [OpamPackage.Name.of_string "ocaml-core-compiler"]
       in
