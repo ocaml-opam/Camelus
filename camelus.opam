@@ -7,20 +7,21 @@ homepage: "https://github.com/AltGr/Camelus"
 bug-reports: "https://github.com/AltGr/Camelus/issues"
 dev-repo: "git+https://github.com/AltGr/Camelus.git"
 depends: [
-  "cohttp-lwt-unix"
+  "cohttp-lwt-unix" { < "2.0.0" }
+  "dune"
+  "git-unix" {>= "1.13" & < "2.0" | = "1.11.5" }
+  "github"
+  "github-unix"
   "opam-format" {>= "2.0.0~beta5"}
   "opam-solver" {>= "2.0.0~beta5"}
-  "opam-state" {>= "2.0.0"}
-  "git-unix" {>= "1.11" & < "2.0"}
-  "fpath"
-  "github-unix"
-  "yojson"
-  "jbuilder"
+  "opam-state" { >= "2.0.1"}
   "tls"
+  "yojson"
+  ("ago" | ("utop"))
+  ("fpath" | "abella")
 ]
-build: ["jbuilder" "build" "-p" name]
+build: ["dune" "build" "-p" name]
 pin-depends: [
-  ["github.3.0.1" "git+https://github.com/AltGr/ocaml-github#21efde3"]
-  ["github-unix.3.0.1" "git+https://github.com/AltGr/ocaml-github#21efde3"]
-  ["opam-state.2.0.0" "git+https://github.com/ocaml/opam#2d318cb8"]
+  ["github.3.1.0" "git+https://github.com/AltGr/ocaml-github#21efde3"]
+  ["github-unix.3.1.0" "git+https://github.com/AltGr/ocaml-github#21efde3"]
 ]

@@ -1253,7 +1253,8 @@ module Conf = struct
       "secret", OpamPp.ppacc
         (fun secret t -> {t with secret}) (fun t -> t.secret)
         (OpamFormat.V.string -|
-         OpamPp.of_pair "secret" Cstruct.(of_string ?allocator:None, to_string));
+         OpamPp.of_pair "secret"
+           Cstruct.((of_string ?allocator:None ?off:None ?len:None), to_string));
       "repo-user", OpamPp.ppacc
         (fun user t -> {t with repo = {t.repo with user}})
         (fun t -> t.repo.user)
