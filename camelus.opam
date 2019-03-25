@@ -19,6 +19,8 @@ depends: [
   "yojson"
   ("ago" | ("utop"))
   ("fpath" | "abella")
+  "lwt_ppx" { build }
+  "fpath"
 ]
 build: ["dune" "build" "-p" name]
 pin-depends: [
