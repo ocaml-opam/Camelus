@@ -692,18 +692,17 @@ module PrChecks = struct
 
   let max_items_in_post = 50
 
+  let opam_files =
+    OpamStd.List.filter_map (fun (s,c) ->
+        match c with
+        | Some c when
+            OpamStd.String.starts_with ~prefix:"packages/" s &&
+            OpamStd.String.ends_with ~suffix:"/opam" s
+          -> Some (s, c)
+        | _ -> None)
+
   let lint ancestor head gitstore =
     let%lwt files = RepoGit.changed_files ancestor head gitstore in
-    let opam_files =
-      OpamStd.List.filter_map (fun (s,c) ->
-          match c with
-          | Some c when
-              OpamStd.String.starts_with ~prefix:"packages/" s &&
-              OpamStd.String.ends_with ~suffix:"/opam" s
-            -> Some (s, c)
-          | _ -> None)
-        files
-    in
     let%lwt lint =
       Lwt_list.map_s (fun (file,contents) ->
           let nv =
@@ -727,7 +726,7 @@ module PrChecks = struct
               contents
           in
           Lwt.return (file, r, opamopt))
-        opam_files
+        (opam_files files)
     in
     let unwanted_warns = [] in
     let lint =
@@ -931,6 +930,109 @@ module PrChecks = struct
       ]
     )
 
+  let upstream_check ancestor head gitstore =
+    let%lwt files = RepoGit.changed_files ancestor head gitstore in
+    let%lwt upstream_check =
+      Lwt_list.map_s (fun (file, contents) ->
+          let filename = OpamFilename.of_string file in
+          let opam =
+            OpamFile.OPAM.read_from_string ~filename:(OpamFile.make filename)
+              contents in
+          let upstream = OpamFile.OPAM.url opam in
+          let result =
+            match upstream with
+            | Some url ->
+              let open OpamProcess.Job.Op in
+              OpamProcess.Job.run @@
+              OpamFilename.with_tmp_dir_job @@ fun dir ->
+              OpamProcess.Job.catch (function
+                    Failure msg -> Done (`err msg)
+                  | e -> Done (`err (Printexc.to_string e)))
+              @@ fun () ->
+              OpamDownload.download ~overwrite:false (OpamFile.URL.url url) dir
+              @@| fun f ->
+              (match OpamFile.URL.checksum url with
+               | [] -> `warn
+               | chks ->
+                 let not_corresponding =
+                   List.filter (fun chk ->
+                       not( OpamHash.check_file (OpamFilename.to_string f) chk))
+                     chks
+                 in
+                 if not_corresponding = [] then
+                   `succ
+                 else
+                   let msg =
+                     Printf.sprintf "Cheksum%s %s don't verify archive"
+                       (if List.length chks = 1 then "" else "s")
+                       (OpamStd.List.to_string OpamHash.to_string not_corresponding)
+                   in
+                   `err msg
+              )
+            | None -> `fatal
+          in
+          let nv =
+            match OpamPackage.of_filename filename with
+            | Some nv -> nv
+            | None -> OpamPackage.of_string "invalid-package-name.v"
+          in
+          Lwt.return (nv, result)
+        ) (opam_files files)
+    in
+    let ok =
+      OpamStd.List.filter_map (fun (nv,res) ->
+          match res with
+          | `succ -> Some nv
+          | _ -> None) upstream_check
+    in
+    let warn =
+      OpamStd.List.filter_map (fun (nv,res) ->
+          match res with
+          | `warn -> Some nv
+          | _ -> None) upstream_check
+    in
+    let err =
+      OpamStd.List.filter_map (fun (nv,res) ->
+          match res with
+            `err m -> Some (nv, m)
+          | _ -> None) upstream_check
+    in
+    let fatal =
+      OpamStd.List.filter_map (fun (nv,res) ->
+          match res with
+          | `fatal -> Some nv
+          | _ -> None) upstream_check
+    in
+    let title, status =
+      if err <> [] || fatal <> []then
+        "##### :x: upstream errors",
+        `Errors (List.map OpamPackage.to_string (fatal @ (List.map fst err)))
+      else if warn <> [] then
+        "##### :link: opam-lint warnings",
+        `Warnings (List.map OpamPackage.to_string warn)
+      else if ok <> [] then
+        "##### :heavy_check_mark: Upstream checked", `Passed
+      else
+        "##### No new or changed opam files", `Passed
+    in
+    let title =
+      Printf.sprintf "%s <small>%s</small>\n\n" title head
+    in
+    let str_pkg =
+      OpamStd.List.concat_map ~last_sep:", and" ", " OpamPackage.to_string
+    in
+    let warn = Printf.sprintf "No checksum defined for %s" (str_pkg warn) in
+    let err =
+      OpamStd.Format.itemize ~bullet:"    * "
+        (fun (nv,msg) -> Printf.sprintf "%s: error `%s`"
+            (OpamPackage.to_string nv) msg) err
+    in
+    let fatal = Printf.sprintf "No upstream defined for %s" (str_pkg fatal) in
+    let message =
+      OpamStd.Format.itemize ~bullet:"  * " (fun x -> x) [fatal ; err ; warn]
+    in
+    Lwt.return (status, title ^ message)
+
   let add_status st1 st2 = match st1, st2 with
     | `Errors a, `Errors b -> `Errors (a@b)
     | `Errors _ as e, _ | _, (`Errors _ as e) -> e
@@ -943,14 +1045,25 @@ module PrChecks = struct
     let head = pr.head.sha in
     let%lwt ancestor = RepoGit.common_ancestor pr gitstore in
     let%lwt (stlint,msglint) = lint ancestor head gitstore in
+    let %lwt (st_upstream, msg_upstream) =
+      upstream_check ancestor head gitstore
+    in
     try%lwt
       let%lwt (stinst,msginst) = installability_check ancestor head gitstore in
-      Lwt.return (add_status stlint stinst,
-                  msglint ^ "\n\n---\n" ^ msginst)
+      let status =
+        let (@) = add_status in
+        stinst @ stlint @ st_upstream
+      in
+      let msg =
+        let (@) = Printf.sprintf "%s\n\n---\n%s" in
+        msginst @ msglint @ msg_upstream
+      in
+      Lwt.return (status, msg)
     with e ->
-        log "Installability check failed: %s%s" (Printexc.to_string e)
-          (Printexc.get_backtrace ());
-        Lwt.return (stlint, msglint)
+      log "Installability check failed: %s%s" (Printexc.to_string e)
+        (Printexc.get_backtrace ());
+      Lwt.return (add_status stlint st_upstream,
+                  msglint ^ "\n\n---\n" ^ msg_upstream)
 
 end
 
