@@ -63,50 +63,55 @@ module RepoGit = struct
   let local_mirror repo =
     Fpath.v (Fmt.strf "./%s%%%s.git" repo.user repo.name)
 
-  let git
-      ?(can_fail=false) ?(silent_fail=false) ?(verbose=false)
-      repo ?env ?input args =
+  let in_git_dir repo f =
     let save_dir = Sys.getcwd () in
-    let cmd = Array.of_list ("git" :: args) in
-    let str_cmd =
-      OpamStd.List.concat_map " "
-        (fun s -> if String.contains s ' ' then Printf.sprintf "%S" s else s)
-        (Array.to_list cmd) in
-    if verbose then log "+ %s" str_cmd;
     Sys.chdir (Fpath.to_string (local_mirror repo));
-    let env =
-      match env with
-      | None -> None
-      | Some e -> Some (Array.append (Unix.environment ()) e)
-    in
-    begin
-      let p = Lwt_process.open_process ("git", cmd) ?env in
-      let ic = p#stdout in
-      let oc = p#stdin in
-      let%lwt r = (
-        let%lwt () = (match input with
-          | None -> Lwt.return_unit
-          | Some s -> Lwt_io.write oc s
-          ) [%lwt.finally Lwt_io.close oc]
-        in
-        Lwt_io.read ic
-      ) [%lwt.finally Lwt_io.close ic ]
+    begin f ()
+    end[%lwt.finally Sys.chdir save_dir;
+      Lwt.return_unit]
+
+  let git
+      ?(can_fail=false) ?(silent_fail=false) ?(verbose=false) ?(do_chdir=true)
+      repo ?env ?input args =
+    let git_no_chdir () =
+      let cmd = Array.of_list ("git" :: args) in
+      let str_cmd =
+        OpamStd.List.concat_map " "
+          (fun s -> if String.contains s ' ' then Printf.sprintf "%S" s else s)
+          (Array.to_list cmd) in
+      if verbose then log "+ %s" str_cmd;
+      let env =
+        match env with
+        | None -> None
+        | Some e -> Some (Array.append (Unix.environment ()) e)
       in
-      if verbose then
-        List.iter (fun s -> print_string "- "; print_endline s)
-          (OpamStd.String.split r '\n');
-      match%lwt p#close with
-      | Unix.WEXITED 0 -> Lwt.return r
-      | Unix.WEXITED i ->
-        if not silent_fail then log "ERROR: command %s returned %d" str_cmd i;
-        if can_fail then Lwt.return r else Lwt.fail (Failure str_cmd)
-      | Unix.WSIGNALED _ | Unix.WSTOPPED _ ->
-        log "ERROR: command %s interrupted" str_cmd;
-        Lwt.fail (Failure str_cmd)
-    end[%lwt.finally
-      Sys.chdir save_dir;
-      Lwt.return_unit
-    ]
+      begin
+        let p = Lwt_process.open_process ("git", cmd) ?env in
+        let ic = p#stdout in
+        let oc = p#stdin in
+        let%lwt r = (
+          let%lwt () = (match input with
+              | None -> Lwt.return_unit
+              | Some s -> Lwt_io.write oc s
+            ) [%lwt.finally Lwt_io.close oc]
+          in
+          Lwt_io.read ic
+        ) [%lwt.finally Lwt_io.close ic ]
+        in
+        if verbose then
+          List.iter (fun s -> print_string "- "; print_endline s)
+            (OpamStd.String.split r '\n');
+        match%lwt p#close with
+        | Unix.WEXITED 0 -> Lwt.return r
+        | Unix.WEXITED i ->
+          if not silent_fail then log "ERROR: command %s returned %d" str_cmd i;
+          if can_fail then Lwt.return r else Lwt.fail (Failure str_cmd)
+        | Unix.WSIGNALED _ | Unix.WSTOPPED _ ->
+          log "ERROR: command %s interrupted" str_cmd;
+          Lwt.fail (Failure str_cmd)
+      end
+    in
+    if do_chdir then in_git_dir repo git_no_chdir else git_no_chdir ()
 
   let get repo =
     OpamSystem.mkdir (Fpath.to_string (local_mirror repo));
@@ -126,6 +131,17 @@ module RepoGit = struct
     | None ->
       log "GET_FILE %s: not found" path;
       Lwt.fail Not_found
+
+  let get_blob ?do_chdir t sha =
+    try%lwt
+      git ?do_chdir t ~verbose:false ~silent_fail:false ["cat-file"; "blob"; sha]
+      >|= OpamStd.Option.some
+    with Failure _ -> Lwt.return_none
+
+  let get_blob_exn ?do_chdir t sha =
+    match%lwt get_blob ?do_chdir t sha with
+    | Some f -> Lwt.return f
+    | None -> log "GET_BLOB %s: not found" sha; Lwt.fail Not_found
 
   let branch_reference name = "refs/heads/" ^ name
 
@@ -185,17 +201,44 @@ module RepoGit = struct
         eos;
       ])
 
+  let opam_hash_and_file_re =
+    Re.(compile @@ seq [
+        bos;
+        repn digit 6 (Some 6);
+        str " blob ";
+        group @@ repn xdigit 40 (Some 40);
+        char '\t';
+        group @@
+        seq
+          [
+            str "packages/";
+            rep1 @@ diff any (char '/');
+            opt @@ seq [char '/'; rep1 @@ diff any (char '/')];
+            str "/opam";
+          ];
+        eos;
+      ])
+
+  let opam_files_pool = Lwt_pool.create 10 (fun () -> Lwt.return_unit)
+
   let opam_files t sha =
-    git t ["ls-tree"; "-r"; "--name-only"; sha; "packages/"]
+    git t ["ls-tree"; "-r"; sha; "packages/"]
     >|= (fun s -> OpamStd.String.split s '\n')
-    >|= List.filter (Re.execp opam_file_re)
-    >>= Lwt_list.fold_left_s (fun acc f ->
-        let filename = OpamFile.make (OpamFilename.of_string f) in
-        try%lwt
-          let%lwt opam = get_file_exn t sha f in
-          Lwt.return (OpamFile.OPAM.read_from_string ~filename opam :: acc)
-        with _ -> Lwt.return acc)
-      []
+    >>= fun l ->
+    in_git_dir t begin fun () ->
+      Lwt_list.filter_map_p (fun s ->
+          match Re.exec_opt opam_hash_and_file_re s with
+          | None -> Lwt.return_none
+          | Some g ->
+            let hash = Re.Group.get g 1 and f = Re.Group.get g 2 in
+            let filename = OpamFile.make (OpamFilename.of_string f) in
+            try%lwt
+              let%lwt opam = Lwt_pool.use opam_files_pool (fun () -> get_blob_exn ~do_chdir:false t hash) in
+              Lwt.return_some (OpamFile.OPAM.read_from_string ~filename opam)
+            with _ -> Lwt_io.printlf "failed on %s" f >>= fun () -> Lwt.return_none)
+        l
+    end
+
 
   (* returns a list (rel_filename * contents) *)
   let extra_files t sha package =
@@ -524,52 +567,52 @@ module FormatUpgrade = struct
        OpamStd.String.Map.is_empty replace_files
     then Lwt.return None
     else
-    let%lwt _ =
-      RepoGit.git gitstore
-        ["reset"; "-q"; "--mixed"; if merge then onto else head]
-    in
-    let%lwt () =
-      Lwt_list.iter_s (fun (path, contents) ->
-          match contents with
-          | Some contents ->
-            let%lwt hash =
-              RepoGit.git gitstore ["hash-object"; "-w"; "--stdin"] ~input:contents
-              >|= String.trim
-            in
-            let%lwt _ =
-              RepoGit.git gitstore
-                ["update-index"; "--ignore-missing"; "--add";
-                 "--cacheinfo"; "100644,"^hash^","^path]
-            in
-            Lwt.return_unit
-          | None ->
-            let%lwt _ =
-              RepoGit.git gitstore
-                ["update-index"; "--ignore-missing"; "--remove"; "--"; path]
-            in
-            Lwt.return_unit)
-        (OpamStd.String.Map.bindings replace_files)
-    in
-    let%lwt tree = RepoGit.git gitstore ["write-tree"] >|= String.trim in
-    let committer = git_identity () in
-    let env = [|
-      "GIT_AUTHOR_NAME="^ author.Git.User.name;
-      "GIT_AUTHOR_EMAIL="^ author.Git.User.email;
-      "GIT_COMMITTER_NAME="^ committer.Git.User.name;
-      "GIT_COMMITTER_EMAIL="^ committer.Git.User.email;
-    |] in
-    let message =
-      message (OpamPackage.Set.elements
-                 (OpamPackage.Set.union packages removed_packages))
-    in
-    RepoGit.git gitstore ~env
-      ("commit-tree" ::
-       "-m" :: message ::
-       (if merge then ["-p"; onto] else []) @
-       [ "-p"; head;
-         tree ])
-    >|= String.trim
-    >|= fun hash -> Some (hash, message)
+      let%lwt _ =
+        RepoGit.git gitstore
+          ["reset"; "-q"; "--mixed"; if merge then onto else head]
+      in
+      let%lwt () =
+        Lwt_list.iter_s (fun (path, contents) ->
+            match contents with
+            | Some contents ->
+              let%lwt hash =
+                RepoGit.git gitstore ["hash-object"; "-w"; "--stdin"] ~input:contents
+                >|= String.trim
+              in
+              let%lwt _ =
+                RepoGit.git gitstore
+                  ["update-index"; "--ignore-missing"; "--add";
+                   "--cacheinfo"; "100644,"^hash^","^path]
+              in
+              Lwt.return_unit
+            | None ->
+              let%lwt _ =
+                RepoGit.git gitstore
+                  ["update-index"; "--ignore-missing"; "--remove"; "--"; path]
+              in
+              Lwt.return_unit)
+          (OpamStd.String.Map.bindings replace_files)
+      in
+      let%lwt tree = RepoGit.git gitstore ["write-tree"] >|= String.trim in
+      let committer = git_identity () in
+      let env = [|
+        "GIT_AUTHOR_NAME="^ author.Git.User.name;
+        "GIT_AUTHOR_EMAIL="^ author.Git.User.email;
+        "GIT_COMMITTER_NAME="^ committer.Git.User.name;
+        "GIT_COMMITTER_EMAIL="^ committer.Git.User.email;
+      |] in
+      let message =
+        message (OpamPackage.Set.elements
+                   (OpamPackage.Set.union packages removed_packages))
+      in
+      RepoGit.git gitstore ~env
+        ("commit-tree" ::
+         "-m" :: message ::
+         (if merge then ["-p"; onto] else []) @
+         [ "-p"; head;
+           tree ])
+      >|= String.trim
+      >|= fun hash -> Some (hash, message)
 
   (** We have conflicts if [onto] was changed in the meantime, i.e. the rewrite
       of [ancestor] doesn't match what we have at the current [onto]. This is
@@ -783,7 +826,7 @@ module PrChecks = struct
                   (fun (num,_,msg) ->
                      Printf.sprintf "**warning %d**: %s" num msg)
                   warns))
-        warnings
+          warnings
     in
     let errs =
       if List.length errors > max_items_in_post then
@@ -948,9 +991,9 @@ module PrChecks = struct
       Lwt.return (add_status stlint stinst,
                   msglint ^ "\n\n---\n" ^ msginst)
     with e ->
-        log "Installability check failed: %s%s" (Printexc.to_string e)
-          (Printexc.get_backtrace ());
-        Lwt.return (stlint, msglint)
+      log "Installability check failed: %s%s" (Printexc.to_string e)
+        (Printexc.get_backtrace ());
+      Lwt.return (stlint, msglint)
 
 end
 
@@ -1120,12 +1163,12 @@ module Webhook_handler = struct
       if base.ref <> base_branch then
         (log "Ignoring PR to %S (!= %S)" base.ref base_branch; None)
       else
-      let pr_user = pr -.- "user" -.- "login" |> to_string in
-      let message =
-        pr -.- "title" |> to_string,
-        pr -.- "body" |> to_string
-      in
-      Some { number; base; head; pr_user; message }
+        let pr_user = pr -.- "user" -.- "login" |> to_string in
+        let message =
+          pr -.- "title" |> to_string,
+          pr -.- "body" |> to_string
+        in
+        Some { number; base; head; pr_user; message }
     | a ->
       log "Ignoring %s PR action" a;
       None
@@ -1142,8 +1185,8 @@ module Webhook_handler = struct
       auth = None;
     } in
     if (* RepoGit.GitStore.Reference.equal *)
-        ((* RepoGit.GitStore.Reference.of_string *) ref) =
-        (RepoGit.branch_reference base_branch)
+      ((* RepoGit.GitStore.Reference.of_string *) ref) =
+      (RepoGit.branch_reference base_branch)
     then
       Some { push_head; push_ancestor; push_repo }
     else
@@ -1164,39 +1207,39 @@ module Webhook_handler = struct
                   "x-hub-signature";  "x-github-event"; ]));
          Server.respond_not_found ())
       else
-      match Yojson.Safe.from_string body with
-      | exception Failure err ->
-        log "Error: invalid json (%s):\n%s" err body;
-        Server.respond_error ~body:"Invalid JSON" ()
-      | json ->
-        match Header.get (Request.headers req) "x-github-event" with
-        | Some "pull_request" ->
-          (match pull_request_of_json base_branch json with
-           | Some pr ->
-             let%lwt () = handler (`Pr pr) in
-             Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
-           | None ->
-             Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
-           | exception Not_found ->
-             log "Error: could not get PR data from JSON:\n%s"
-               (Yojson.Safe.to_string json);
-             Server.respond_error ~body:"Invalid format" ())
-        | Some "push" ->
-          (match push_event_of_json base_branch json with
-           | Some push ->
-             let%lwt () = handler (`Push push) in
-             Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
-           | None ->
-             Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
-           | exception Not_found ->
-             log "Error: could not get push event data from JSON:\n%s"
-               (Yojson.Safe.to_string json);
-             Server.respond_error ~body:"Invalid format" ())
-        | Some a ->
-          log "Ignored %s event" a;
-          Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
-        | None ->
-          Server.respond_error ~body:"Invalid format" ()
+        match Yojson.Safe.from_string body with
+        | exception Failure err ->
+          log "Error: invalid json (%s):\n%s" err body;
+          Server.respond_error ~body:"Invalid JSON" ()
+        | json ->
+          match Header.get (Request.headers req) "x-github-event" with
+          | Some "pull_request" ->
+            (match pull_request_of_json base_branch json with
+             | Some pr ->
+               let%lwt () = handler (`Pr pr) in
+               Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
+             | None ->
+               Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
+             | exception Not_found ->
+               log "Error: could not get PR data from JSON:\n%s"
+                 (Yojson.Safe.to_string json);
+               Server.respond_error ~body:"Invalid format" ())
+          | Some "push" ->
+            (match push_event_of_json base_branch json with
+             | Some push ->
+               let%lwt () = handler (`Push push) in
+               Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
+             | None ->
+               Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
+             | exception Not_found ->
+               log "Error: could not get push event data from JSON:\n%s"
+                 (Yojson.Safe.to_string json);
+               Server.respond_error ~body:"Invalid format" ())
+          | Some a ->
+            log "Ignored %s event" a;
+            Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
+          | None ->
+            Server.respond_error ~body:"Invalid format" ()
     in
     log "Listening on port %d" port;
     Server.create
