@@ -50,77 +50,94 @@ type push_event = {
   push_ancestor: string;
 }
 
+module FdPool = struct
+
+  let max_count = 50
+  let curr_count = ref 0
+
+  let c : unit Lwt_condition.t = Lwt_condition.create ()
+
+  let fd_use () =
+    if !curr_count < max_count
+    then ( incr curr_count; Lwt.return_unit )
+    else ( Lwt_condition.wait c >>= fun () -> incr curr_count; Lwt.return_unit )
+
+  let fd_free () =
+    decr curr_count; Lwt_condition.signal c ()
+
+  let with_fd (f : unit -> 'a Lwt.t) : 'a Lwt.t =
+    begin fd_use () >>= f end
+      [%lwt.finally fd_free (); Lwt.return_unit]
+
+end
+
 module RepoGit = struct
 
   module M = OpamStd.String.Map
 
   type t = repo
 
+  let github_repo_string repo =
+    Printf.sprintf "https://%sgithub.com/%s/%s.git"
+      (match repo.auth with
+       | None -> ""
+       | Some (user, token) -> Printf.sprintf "%s:%s@" user token)
+      repo.user repo.name
+
   let github_repo repo =
-    Uri.of_string
-      (Printf.sprintf "https://%sgithub.com/%s/%s.git"
-         (match repo.auth with
-          | None -> ""
-          | Some (user, token) -> Printf.sprintf "%s:%s@" user token)
-         repo.user repo.name)
+    Uri.of_string @@ github_repo_string repo
+
 
   let local_mirror repo =
     Fpath.v (Fmt.strf "./%s%%%s.git" repo.user repo.name)
 
-  let in_git_dir repo f =
-    let save_dir = Sys.getcwd () in
-    Sys.chdir (Fpath.to_string (local_mirror repo));
-    begin f ()
-    end[%lwt.finally Sys.chdir save_dir;
-      Lwt.return_unit]
+  let write_lock = Lwt_mutex.create ()
 
   let git
-      ?(can_fail=false) ?(silent_fail=false) ?(verbose=verbose) ?(do_chdir=true)
+      ?(can_fail=false) ?(silent_fail=false) ?(verbose=verbose) ?(writing=false)
       repo ?env ?input args =
-    let git_no_chdir () =
-      let cmd = Array.of_list ("git" :: args) in
-      let str_cmd =
-        OpamStd.List.concat_map " "
-          (fun s -> if String.contains s ' ' then Printf.sprintf "%S" s else s)
-          (Array.to_list cmd) in
-      if verbose then log "+ %s" str_cmd;
-      let env =
-        match env with
-        | None -> None
-        | Some e -> Some (Array.append (Unix.environment ()) e)
-      in
-      begin
-        let p = Lwt_process.open_process ("git", cmd) ?env in
-        let ic = p#stdout in
-        let oc = p#stdin in
-        let%lwt r = (
-          let%lwt () = (match input with
-              | None -> Lwt.return_unit
-              | Some s -> Lwt_io.write oc s
-            ) [%lwt.finally Lwt_io.close oc]
-          in
-          Lwt_io.read ic
-        ) [%lwt.finally Lwt_io.close ic ]
-        in
-        if verbose then
-          List.iter (fun s -> print_string "- "; print_endline s)
-            (OpamStd.String.split r '\n');
-        match%lwt p#close with
-        | Unix.WEXITED 0 -> Lwt.return r
-        | Unix.WEXITED i ->
-          if not silent_fail then log "ERROR: command %s returned %d" str_cmd i;
-          if can_fail then Lwt.return r else Lwt.fail (Failure str_cmd)
-        | Unix.WSIGNALED _ | Unix.WSTOPPED _ ->
-          log "ERROR: command %s interrupted" str_cmd;
-          Lwt.fail (Failure str_cmd)
-      end
+    let cmd = Array.of_list ("git" :: "-C" :: (Fpath.to_string (local_mirror repo)) :: args) in
+    let str_cmd =
+      OpamStd.List.concat_map " "
+        (fun s -> if String.contains s ' ' then Printf.sprintf "%S" s else s)
+        (Array.to_list cmd) in
+    if verbose then log "+ %s" str_cmd;
+    let env =
+      match env with
+      | None -> None
+      | Some e -> Some (Array.append (Unix.environment ()) e)
     in
-    if do_chdir then in_git_dir repo git_no_chdir else git_no_chdir ()
+    let git_call () =
+      let p = Lwt_process.open_process ("git", cmd) ?env in
+      let ic = p#stdout in
+      let oc = p#stdin in
+      let%lwt r = (
+        let%lwt () = (match input with
+            | None -> Lwt.return_unit
+            | Some s -> Lwt_io.write oc s
+          ) [%lwt.finally Lwt_io.close oc]
+        in
+        Lwt_io.read ic
+      ) [%lwt.finally Lwt_io.close ic ]
+      in
+      if verbose then
+        List.iter (fun s -> print_string "- "; print_endline s)
+          (OpamStd.String.split r '\n');
+      match%lwt p#close with
+      | Unix.WEXITED 0 -> Lwt.return r
+      | Unix.WEXITED i ->
+        if not silent_fail then log "ERROR: command %s returned %d" str_cmd i;
+        if can_fail then Lwt.return r else Lwt.fail (Failure str_cmd)
+      | Unix.WSIGNALED _ | Unix.WSTOPPED _ ->
+        log "ERROR: command %s interrupted" str_cmd;
+        Lwt.fail (Failure str_cmd)
+    in
+    FdPool.with_fd @@ if writing then (fun () -> Lwt_mutex.with_lock write_lock git_call) else git_call
 
   let get repo =
     OpamSystem.mkdir (Fpath.to_string (local_mirror repo));
-    let%lwt _ = git repo ["init"] in
-    let%lwt _ = git repo ["config"; "receive.denyCurrentBranch"; "ignore"] in
+    let%lwt _ = git ~writing:true repo ["init"] in
+    let%lwt _ = git ~writing:true repo ["config"; "receive.denyCurrentBranch"; "ignore"] in
     Lwt.return (Ok repo)
 
   let get_file t sha path =
@@ -136,18 +153,20 @@ module RepoGit = struct
       log "GET_FILE %s: not found" path;
       Lwt.fail Not_found
 
-  let get_blob ?do_chdir t sha =
+  let get_blob t sha =
     try%lwt
-      git ?do_chdir t ~verbose:false ~silent_fail:false ["cat-file"; "blob"; sha]
+      git t ~verbose:false ~silent_fail:false ["cat-file"; "blob"; sha]
       >|= OpamStd.Option.some
     with Failure _ -> Lwt.return_none
 
-  let get_blob_exn ?do_chdir t sha =
-    match%lwt get_blob ?do_chdir t sha with
+  let get_blob_exn t sha =
+    match%lwt get_blob t sha with
     | Some f -> Lwt.return f
     | None -> log "GET_BLOB %s: not found" sha; Lwt.fail Not_found
 
   let branch_reference name = "refs/heads/" ^ name
+
+  let pr_branch pr = "pr/" ^ (string_of_int pr.number)
 
   let get_branch t branch =
     git t ["rev-parse"; branch_reference branch]
@@ -157,12 +176,13 @@ module RepoGit = struct
     git t ["branch"; "-f"; branch_reference name; commit_hash]
     >|= ignore
 
-  let fetch t ?(branches=[]) repo =
+  let fetch t ?(manual_branches=[]) ?(branches=[]) repo =
     let remote b = "refs/remotes/" ^ repo.user ^ "/" ^ b in
     let b =
+      manual_branches @
       List.map (fun b -> "+" ^ branch_reference b ^ ":" ^ remote b) branches
     in
-    let%lwt _ = git t ("fetch" :: Uri.to_string (github_repo repo) :: b) in
+    let%lwt _ = git ~writing:true t ("fetch" :: Uri.to_string (github_repo repo) :: b) in
     Lwt_list.map_s (fun b ->
         log "fetched %s" b;
         git t ["rev-parse"; remote b] >|= String.trim)
@@ -174,9 +194,10 @@ module RepoGit = struct
     in
     log "fetched upstream";
     let%lwt _head_fetch =
-      fetch t ~branches:[pull_request.head.ref] pull_request.head.repo
+      let prn = string_of_int pull_request.number in
+      fetch t ~manual_branches:[ "+pull/" ^ prn ^"/head:pr/" ^ prn ] pull_request.base.repo
     in
-    log "fetched user repo";
+    log "fetched user pr";
     Lwt.return_unit
 
   let push ?(force=false) t branch repo =
@@ -194,16 +215,6 @@ module RepoGit = struct
     >>= fun s ->
     let paths = OpamStd.String.split s '\n' in
     Lwt_list.map_s (fun p -> get_file t head p >|= fun c -> p, c) paths
-
-  let opam_file_re =
-    Re.(compile @@ seq [
-        bos;
-        str "packages/";
-        rep1 @@ diff any (char '/');
-        opt @@ seq [char '/'; rep1 @@ diff any (char '/')];
-        str "/opam";
-        eos;
-      ])
 
   let opam_hash_and_file_re =
     Re.(compile @@ seq [
@@ -223,25 +234,19 @@ module RepoGit = struct
         eos;
       ])
 
-  let opam_files_pool = Lwt_pool.create 10 (fun () -> Lwt.return_unit)
-
   let opam_files t sha =
     git t ["ls-tree"; "-r"; sha; "packages/"]
     >|= (fun s -> OpamStd.String.split s '\n')
-    >>= fun l ->
-    in_git_dir t begin fun () ->
-      Lwt_list.filter_map_p (fun s ->
-          match Re.exec_opt opam_hash_and_file_re s with
-          | None -> Lwt.return_none
-          | Some g ->
-            let hash = Re.Group.get g 1 and f = Re.Group.get g 2 in
-            let filename = OpamFile.make (OpamFilename.of_string f) in
-            try%lwt
-              let%lwt opam = Lwt_pool.use opam_files_pool (fun () -> get_blob_exn ~do_chdir:false t hash) in
-              Lwt.return_some (OpamFile.OPAM.read_from_string ~filename opam)
-            with _ -> Lwt_io.printlf "failed on %s" f >>= fun () -> Lwt.return_none)
-        l
-    end
+    >>= Lwt_list.filter_map_p (fun s ->
+        match Re.exec_opt opam_hash_and_file_re s with
+        | None -> Lwt.return_none
+        | Some g ->
+          let hash = Re.Group.get g 1 and f = Re.Group.get g 2 in
+          let filename = OpamFile.make (OpamFilename.of_string f) in
+          try%lwt
+            let%lwt opam = get_blob_exn t hash in
+            Lwt.return_some (OpamFile.OPAM.read_from_string ~filename opam)
+          with _ -> Lwt_io.printlf "failed on %s" f >>= fun () -> Lwt.return_none)
 
 
   (* returns a list (rel_filename * contents) *)
@@ -830,7 +835,7 @@ module PrChecks = struct
                   (fun (num,_,msg) ->
                      Printf.sprintf "**warning %d**: %s" num msg)
                   warns))
-        warnings
+          warnings
     in
     let errs =
       if List.length errors > max_items_in_post then
@@ -1038,9 +1043,9 @@ module PrChecks = struct
       Lwt.return (add_status stlint stinst,
                   msglint ^ "\n\n---\n" ^ msginst)
     with e ->
-        log "Installability check failed: %s%s" (Printexc.to_string e)
-          (Printexc.get_backtrace ());
-        Lwt.return (stlint, msglint)
+      log "Installability check failed: %s%s" (Printexc.to_string e)
+        (Printexc.get_backtrace ());
+      Lwt.return (stlint, msglint)
 
 end
 
@@ -1149,152 +1154,6 @@ module Github_comment = struct
 
 end
 
-module Webhook_handler = struct
-
-  open Cohttp
-  open Cohttp_lwt_unix
-
-  let uri_path = "/opam-ci"
-  let exp_method = `POST
-  let exp_ua_prefix = "GitHub-Hookshot/"
-
-  (** Check that the request is well-formed and originated from GitHub *)
-  let check_github ~secret req body =
-    let headers = Request.headers req in
-    Uri.path (Request.uri req) = uri_path &&
-    Request.meth req = exp_method &&
-    OpamStd.Option.Op.(
-      (Header.get headers "user-agent" >>|
-       OpamStd.String.starts_with ~prefix:exp_ua_prefix) +! false) &&
-    Header.get_media_type headers = Some "application/json" &&
-    Header.get headers "x-github-event" <> None &&
-    OpamStd.Option.Op.(
-      Header.get headers "x-hub-signature" >>|
-      OpamStd.String.remove_prefix ~prefix:"sha1=" >>|
-      Nocrypto.Uncommon.Cs.of_hex >>|
-      Cstruct.equal (Nocrypto.Hash.mac `SHA1 ~key:secret (Cstruct.of_string body))
-    ) = Some true
-
-  module JS = struct
-    let (-.-) json key = match json with
-      | `Assoc dic -> List.assoc key dic
-      | _ -> log "field %s not found" key; raise Not_found
-    let to_string = function
-      | `String s -> s
-      | `Null -> ""
-      | j ->
-        log "JSON error: not a string %s" (Yojson.Safe.to_string j);
-        raise Not_found
-    let to_int = function
-      | `Int i -> i
-      | j ->
-        log "JSON error: not an int %s" (Yojson.Safe.to_string j);
-        raise Not_found
-  end
-
-  let pull_request_of_json base_branch json =
-    let open JS in
-    match json -.- "action" |> to_string with
-    | "opened" | "reopened" | "synchronize" ->
-      let number = json -.- "number" |> to_int in
-      let pr = json -.- "pull_request" in
-      let full_repo r = {
-        repo = { user = r -.- "user" -.- "login" |> to_string;
-                 name = r -.- "repo" -.- "name" |> to_string;
-                 auth = None; };
-        ref = r -.- "ref" |> to_string;
-        sha = r -.- "sha" |> to_string;
-      } in
-      let base = full_repo (pr -.- "base") in
-      let head = full_repo (pr -.- "head") in
-      if base.ref <> base_branch then
-        (log "Ignoring PR to %S (!= %S)" base.ref base_branch; None)
-      else
-      let pr_user = pr -.- "user" -.- "login" |> to_string in
-      let message =
-        pr -.- "title" |> to_string,
-        pr -.- "body" |> to_string
-      in
-      Some { number; base; head; pr_user; message }
-    | a ->
-      log "Ignoring %s PR action" a;
-      None
-
-  let push_event_of_json base_branch json =
-    let open JS in
-    let ref = json -.- "ref" |> to_string in
-    let push_head = json -.- "after" |> to_string  in
-    let push_ancestor = json -.- "before" |> to_string in
-    let r = json -.- "repository" in
-    let push_repo = {
-      user = r -.- "owner" -.- "name" |> to_string;
-      name = r -.- "name" |> to_string;
-      auth = None;
-    } in
-    if (* RepoGit.GitStore.Reference.equal *)
-        ((* RepoGit.GitStore.Reference.of_string *) ref) =
-        (RepoGit.branch_reference base_branch)
-    then
-      Some { push_head; push_ancestor; push_repo }
-    else
-      (log "Ignoring push to %s" ref; None)
-
-  let server ~port ~secret ~handler base_branch dest_branch =
-    let callback (conn, _) req body =
-      let%lwt body = Cohttp_lwt.Body.to_string body in
-      if not (check_github ~secret req body) then
-        (log "Ignored invalid request:\n%s"
-           (OpamStd.Format.itemize (fun s -> s)
-              (Uri.path (Request.uri req) ::
-               Code.string_of_method (Request.meth req) ::
-               OpamStd.Option.to_string (fun x -> x)
-                 (Header.get_media_type (Request.headers req)) ::
-               OpamStd.List.filter_map (Header.get (Request.headers req))
-                 ["user-agent"; "content-type";
-                  "x-hub-signature";  "x-github-event"; ]));
-         Server.respond_not_found ())
-      else
-      match Yojson.Safe.from_string body with
-      | exception Failure err ->
-        log "Error: invalid json (%s):\n%s" err body;
-        Server.respond_error ~body:"Invalid JSON" ()
-      | json ->
-        match Header.get (Request.headers req) "x-github-event" with
-        | Some "pull_request" ->
-          (match pull_request_of_json base_branch json with
-           | Some pr ->
-             let%lwt () = handler (`Pr pr) in
-             Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
-           | None ->
-             Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
-           | exception Not_found ->
-             log "Error: could not get PR data from JSON:\n%s"
-               (Yojson.Safe.to_string json);
-             Server.respond_error ~body:"Invalid format" ())
-        | Some "push" ->
-          (match push_event_of_json base_branch json with
-           | Some push ->
-             let%lwt () = handler (`Push push) in
-             Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
-           | None ->
-             Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
-           | exception Not_found ->
-             log "Error: could not get push event data from JSON:\n%s"
-               (Yojson.Safe.to_string json);
-             Server.respond_error ~body:"Invalid format" ())
-        | Some a ->
-          log "Ignored %s event" a;
-          Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
-        | None ->
-          Server.respond_error ~body:"Invalid format" ()
-    in
-    log "Listening on port %d" port;
-    Server.create
-      ~on_exn:(fun e -> log "Server exn: %s" (Printexc.to_string e))
-      ~mode:(`TCP (`Port port))
-      (Server.make ~callback ())
-end
-
 module Conf = struct
   module C = struct
     let internal = ".opam-ci"
@@ -1376,4 +1235,154 @@ module Conf = struct
   end
   include C
   include OpamFile.SyntaxFile(C)
+end
+
+module Webhook_handler = struct
+
+
+  module Camelus_conf = Conf
+  open Cohttp
+  open Cohttp_lwt_unix
+
+  let uri_path = "/opam-ci"
+  let exp_method = `POST
+  let exp_ua_prefix = "GitHub-Hookshot/"
+
+  (** Check that the request is well-formed and originated from GitHub *)
+  let check_github ~secret req body =
+    let headers = Request.headers req in
+    Uri.path (Request.uri req) = uri_path &&
+    Request.meth req = exp_method &&
+    OpamStd.Option.Op.(
+      (Header.get headers "user-agent" >>|
+       OpamStd.String.starts_with ~prefix:exp_ua_prefix) +! false) &&
+    Header.get_media_type headers = Some "application/json" &&
+    Header.get headers "x-github-event" <> None &&
+    OpamStd.Option.Op.(
+      Header.get headers "x-hub-signature" >>|
+      OpamStd.String.remove_prefix ~prefix:"sha1=" >>|
+      Nocrypto.Uncommon.Cs.of_hex >>|
+      Cstruct.equal (Nocrypto.Hash.mac `SHA1 ~key:secret (Cstruct.of_string body))
+    ) = Some true
+
+  module JS = struct
+    let (-.-) json key = match json with
+      | `Assoc dic -> List.assoc key dic
+      | _ -> log "field %s not found" key; raise Not_found
+    let to_string = function
+      | `String s -> s
+      | `Null -> ""
+      | j ->
+        log "JSON error: not a string %s" (Yojson.Safe.to_string j);
+        raise Not_found
+    let to_int = function
+      | `Int i -> i
+      | j ->
+        log "JSON error: not an int %s" (Yojson.Safe.to_string j);
+        raise Not_found
+  end
+
+  let pull_request_of_json base_branch json =
+    let open JS in
+    match json -.- "action" |> to_string with
+    | "opened" | "reopened" | "synchronize" ->
+      let number = json -.- "number" |> to_int in
+      let pr = json -.- "pull_request" in
+      let full_repo r = {
+        repo = { user = r -.- "user" -.- "login" |> to_string;
+                 name = r -.- "repo" -.- "name" |> to_string;
+                 auth = None; };
+        ref = r -.- "ref" |> to_string;
+        sha = r -.- "sha" |> to_string;
+      } in
+      let base = full_repo (pr -.- "base") in
+      let head = full_repo (pr -.- "head") in
+      if base.ref <> base_branch then
+        (log "Ignoring PR to %S (!= %S)" base.ref base_branch; None)
+      else
+      let pr_user = pr -.- "user" -.- "login" |> to_string in
+      let message =
+        pr -.- "title" |> to_string,
+        pr -.- "body" |> to_string
+      in
+      Some { number; base; head; pr_user; message }
+    | a ->
+      log "Ignoring %s PR action" a;
+      None
+
+  let push_event_of_json base_branch json =
+    let open JS in
+    let ref = json -.- "ref" |> to_string in
+    let push_head = json -.- "after" |> to_string  in
+    let push_ancestor = json -.- "before" |> to_string in
+    let r = json -.- "repository" in
+    let push_repo = {
+      user = r -.- "owner" -.- "name" |> to_string;
+      name = r -.- "name" |> to_string;
+      auth = None;
+    } in
+    if (* RepoGit.GitStore.Reference.equal *)
+      ((* RepoGit.GitStore.Reference.of_string *) ref) =
+      (RepoGit.branch_reference base_branch)
+    then
+      Some { push_head; push_ancestor; push_repo }
+    else
+      (log "Ignoring push to %s" ref; None)
+
+  let server ~(conf:Camelus_conf.t) ~handler =
+    let port = conf.port and secret = conf.secret
+    and base_branch = conf.base_branch in
+    let callback (conn, _) req body =
+      let%lwt body = Cohttp_lwt.Body.to_string body in
+      if not (check_github ~secret req body) then
+        (log "Ignored invalid request:\n%s"
+           (OpamStd.Format.itemize (fun s -> s)
+              (Uri.path (Request.uri req) ::
+               Code.string_of_method (Request.meth req) ::
+               OpamStd.Option.to_string (fun x -> x)
+                 (Header.get_media_type (Request.headers req)) ::
+               OpamStd.List.filter_map (Header.get (Request.headers req))
+                 ["user-agent"; "content-type";
+                  "x-hub-signature";  "x-github-event"; ]));
+         Server.respond_not_found ())
+      else
+      match Yojson.Safe.from_string body with
+      | exception Failure err ->
+        log "Error: invalid json (%s):\n%s" err body;
+        Server.respond_error ~body:"Invalid JSON" ()
+      | json ->
+        match Header.get (Request.headers req) "x-github-event" with
+        | Some "pull_request" ->
+          (match pull_request_of_json base_branch json with
+           | Some pr ->
+             let%lwt () = handler (`Pr pr) in
+             Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
+           | None ->
+             Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
+           | exception Not_found ->
+             log "Error: could not get PR data from JSON:\n%s"
+               (Yojson.Safe.to_string json);
+             Server.respond_error ~body:"Invalid format" ())
+        | Some "push" ->
+          (match push_event_of_json base_branch json with
+           | Some push ->
+             let%lwt () = handler (`Push push) in
+             Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
+           | None ->
+             Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
+           | exception Not_found ->
+             log "Error: could not get push event data from JSON:\n%s"
+               (Yojson.Safe.to_string json);
+             Server.respond_error ~body:"Invalid format" ())
+        | Some a ->
+          log "Ignored %s event" a;
+          Server.respond ~status:`OK ~body:Cohttp_lwt.Body.empty ()
+        | None ->
+          Server.respond_error ~body:"Invalid format" ()
+    in
+    log "Listening on port %d" port;
+    Server.create
+      ~on_exn:(fun e -> log "Server exn: %s" (Printexc.to_string e))
+      ~mode:(`TCP (`Port port))
+      (Server.make ~callback ())
 end

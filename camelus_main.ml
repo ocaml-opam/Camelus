@@ -36,8 +36,10 @@ let () =
   let pr_checker = List.mem `Pr_checker conf.Conf.roles in
   let push_upgrader = List.mem `Push_upgrader conf.Conf.roles in
   let rec check_loop gitstore =
-    (* The checks are done sequentially *)
-    let%lwt () =
+    (* The checks are done concurrently *)
+    let () =
+      Lwt.async @@
+      fun () ->
       try%lwt
         match%lwt Lwt_stream.next event_stream with
         | `Pr pr when pr_checker ->
@@ -119,9 +121,6 @@ let () =
        | Ok r -> check_loop r
        | Error e -> Lwt.fail (Failure "Repository loading failed"));
       Webhook_handler.server
-        ~port:conf.Conf.port
-        ~secret:conf.Conf.secret
-        ~handler
-        conf.Conf.base_branch
-        conf.Conf.dest_branch;
+        ~conf
+        ~handler;
     ])
