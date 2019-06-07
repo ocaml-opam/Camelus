@@ -20,6 +20,10 @@ open Lwt.Infix
 
 let log fmt = OpamConsole.msg (fmt ^^ "\n%!")
 
+let verbose =
+  try Sys.getenv "CAMELUS_VERBOSE" <> ""
+  with Not_found -> false
+
 type repo = {
   user: string;
   name: string;
@@ -71,7 +75,7 @@ module RepoGit = struct
       Lwt.return_unit]
 
   let git
-      ?(can_fail=false) ?(silent_fail=false) ?(verbose=false) ?(do_chdir=true)
+      ?(can_fail=false) ?(silent_fail=false) ?(verbose=verbose) ?(do_chdir=true)
       repo ?env ?input args =
     let git_no_chdir () =
       let cmd = Array.of_list ("git" :: args) in
