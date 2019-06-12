@@ -876,6 +876,17 @@ module PrChecks = struct
     let packages =
       OpamPackage.Set.of_list (OpamPackage.Map.keys m)
     in
+    let env_global v =
+      match OpamVariable.Full.scope v,
+            OpamVariable.(to_string (Full.variable v))
+      with
+      | OpamVariable.Full.Global, "opam-version" ->
+        Some (S OpamVersion.(to_string current))
+      | OpamVariable.Full.Global, "with-test" -> Some (B false)
+      | OpamVariable.Full.Global, "with-doc" -> Some (B false)
+      | OpamVariable.Full.Global, "dev" -> Some (B false)
+      | _ -> None
+    in
     let env nv v =
       match OpamVariable.Full.scope v,
             OpamVariable.(to_string (Full.variable v))
@@ -884,18 +895,18 @@ module PrChecks = struct
         Some (S (OpamPackage.Name.to_string nv.name))
       | (OpamVariable.Full.Global | OpamVariable.Full.Self), "version" ->
         Some (S (OpamPackage.Version.to_string nv.version))
-      | OpamVariable.Full.Global, "opam-version" ->
-        Some (S OpamVersion.(to_string current))
-      | OpamVariable.Full.Global, "with-test" -> Some (B false)
-      | OpamVariable.Full.Global, "with-doc" -> Some (B false)
-      | OpamVariable.Full.Global, "dev" -> Some (B false)
-      | _ -> None
+      | _ -> env_global v
     in
     let universe = {
       u_packages = packages;
       u_action = Query;
       u_installed = OpamPackage.Set.empty;
-      u_available = packages; (* Todo: check for different constraints *)
+      u_available =
+        OpamPackage.Map.filter (fun _ opam ->
+            OpamFilter.eval_to_bool ~default:true env_global
+              (OpamFile.OPAM.available opam))
+          m
+        |> OpamPackage.keys;
       u_depends =
         OpamPackage.Map.mapi
           (fun nv o ->
