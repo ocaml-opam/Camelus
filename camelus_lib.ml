@@ -739,22 +739,23 @@ module PrChecks = struct
 
   let max_items_in_post = 50
 
-  let lint ancestor head gitstore =
+  let changed_opam_files ancestor head gitstore =
     let%lwt files = RepoGit.changed_files ancestor head gitstore in
-    let opam_files =
-      OpamStd.List.filter_map (fun (s,c) ->
-          match c with
-          | Some c when
-              OpamStd.String.starts_with ~prefix:"packages/" s &&
-              OpamStd.String.ends_with ~suffix:"/opam" s
-            -> Some (s, c)
-          | _ -> None)
-        files
-    in
+    Lwt.return @@
+    OpamStd.List.filter_map (fun (s,c) ->
+        match c with
+        | Some c when
+            OpamStd.String.starts_with ~prefix:"packages/" s &&
+            OpamStd.String.ends_with ~suffix:"/opam" s
+          -> Some (OpamFilename.of_string s, c)
+        | _ -> None)
+      files
+
+  let lint head gitstore opam_files =
     let%lwt lint =
       Lwt_list.map_s (fun (file,contents) ->
           let nv =
-            match OpamPackage.of_filename (OpamFilename.of_string file) with
+            match OpamPackage.of_filename file with
             | Some nv -> nv
             | None -> OpamPackage.of_string "invalid-package-name.v"
           in
@@ -770,7 +771,7 @@ module PrChecks = struct
           in
           let r, opamopt =
             OpamFileTools.lint_string ~check_extra_files
-              (OpamFile.make (OpamFilename.of_string file))
+              (OpamFile.make file)
               contents
           in
           Lwt.return (file, r, opamopt))
@@ -805,9 +806,8 @@ module PrChecks = struct
     in
     let pkgname (f,_,_) =
       OpamStd.Option.Op.(
-        (OpamPackage.(of_filename OpamFilename.(of_string f))
-         >>| pkg_to_string)
-        +! f)
+        (OpamPackage.of_filename f >>| pkg_to_string)
+        +! OpamFilename.to_string f)
     in
     let pass =
       OpamStd.List.concat_map ", "
@@ -860,7 +860,7 @@ module PrChecks = struct
     Lwt.return
       (status, String.concat "" [title; errs; warns; pass])
 
-  let installable gitstore sha =
+  let installable gitstore sha packages =
     let%lwt opams = RepoGit.opam_files gitstore sha in
     log "opam files at %s: %d" sha (List.length opams);
     let open OpamTypes in
@@ -873,7 +873,7 @@ module PrChecks = struct
           OpamPackage.Map.add nv o m)
         OpamPackage.Map.empty opams
     in
-    let packages =
+    let all_packages =
       OpamPackage.Set.of_list (OpamPackage.Map.keys m)
     in
     let env_global v =
@@ -898,7 +898,7 @@ module PrChecks = struct
       | _ -> env_global v
     in
     let universe = {
-      u_packages = packages;
+      u_packages = all_packages;
       u_action = Query;
       u_installed = OpamPackage.Set.empty;
       u_available =
@@ -931,18 +931,27 @@ module PrChecks = struct
       u_attrs = [];
       u_reinstall = OpamPackage.Set.empty;
     } in
-    let%lwt installable =
-      Lwt_preemptive.detach OpamSolver.installable universe
+    let packages =
+      OpamPackage.Set.union packages @@
+      OpamPackage.Set.of_list @@
+      OpamSolver.reverse_dependencies
+        ~depopts:false ~build:true ~post:true ~installed:false ~unavailable:true
+        universe packages
     in
-    log "... of which %d installable" (OpamPackage.Set.cardinal installable);
+    log "... %d related packages" (OpamPackage.Set.cardinal packages);
+    let%lwt installable =
+      Lwt_preemptive.detach (OpamSolver.installable_subset universe) packages
+    in
+    log "... of which %d installable"
+      (OpamPackage.Set.cardinal installable);
     Lwt.return (packages, installable)
 
-  let installability_check ancestor head gitstore =
+  let installability_check ancestor head gitstore packages =
     let%lwt packages_before, installable_before =
-      installable gitstore ancestor
+      installable gitstore ancestor packages
     in
     let%lwt packages_after, installable_after =
-      installable gitstore head
+      installable gitstore head packages
     in
     let open OpamPackage.Set.Op in
     let fresh = packages_after -- packages_before in
@@ -952,10 +961,10 @@ module PrChecks = struct
     let repairs = broken_before -- broken_after in
     let no_breaks = OpamPackage.Set.is_empty breaks in
     let title =
-      Printf.sprintf "\n\n##### :%s: Installability check (%d &rarr; %d)\n\n"
+      Printf.sprintf "\n\n##### :%s: Installability check (%+d)\n\n"
         (if no_breaks then "sunny" else "sun_behind_small_cloud")
-        (OpamPackage.Set.cardinal installable_before)
-        (OpamPackage.Set.cardinal installable_after)
+        (OpamPackage.Set.cardinal installable_after -
+         OpamPackage.Set.cardinal installable_before)
     in
     let msg (s,set) =
       if OpamPackage.Set.is_empty set then None else
@@ -1000,9 +1009,19 @@ module PrChecks = struct
     let%lwt () = RepoGit.fetch_pr pr gitstore in
     let head = pr.head.sha in
     let%lwt ancestor = RepoGit.common_ancestor pr gitstore in
-    let%lwt (stlint,msglint) = lint ancestor head gitstore in
+    let%lwt opam_files = changed_opam_files ancestor head gitstore in
+    let%lwt (stlint,msglint) = lint head gitstore opam_files in
+    let packages =
+      List.fold_left (fun pkgs (f,_) -> match OpamPackage.of_filename f with
+          | None -> pkgs
+          | Some nv -> OpamPackage.Set.add nv pkgs)
+        OpamPackage.Set.empty
+        opam_files
+    in
     try%lwt
-      let%lwt (stinst,msginst) = installability_check ancestor head gitstore in
+      let%lwt (stinst,msginst) =
+        installability_check ancestor head gitstore packages
+      in
       Lwt.return (add_status stlint stinst,
                   msglint ^ "\n\n---\n" ^ msginst)
     with e ->
