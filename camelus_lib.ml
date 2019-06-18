@@ -860,9 +860,9 @@ module PrChecks = struct
     Lwt.return
       (status, String.concat "" [title; errs; warns; pass])
 
-  let installable gitstore sha packages =
+  let get_universe gitstore sha ~name =
     let%lwt opams = RepoGit.opam_files gitstore sha in
-    log "opam files at %s: %d" sha (List.length opams);
+    log "opam files at %s %s: %d" name sha (List.length opams);
     let open OpamTypes in
     let m =
       List.fold_left (fun m o ->
@@ -897,7 +897,7 @@ module PrChecks = struct
         Some (S (OpamPackage.Version.to_string nv.version))
       | _ -> env_global v
     in
-    let universe = {
+    Lwt.return {
       u_packages = all_packages;
       u_action = Query;
       u_installed = OpamPackage.Set.empty;
@@ -930,30 +930,43 @@ module PrChecks = struct
       u_base = OpamPackage.Set.empty;
       u_attrs = [];
       u_reinstall = OpamPackage.Set.empty;
-    } in
+    }
+
+  let reverse_dependencies universe packages =
+    OpamPackage.Set.union packages @@
+    OpamPackage.Set.of_list @@
+    OpamSolver.reverse_dependencies
+      ~depopts:false ~build:true ~post:true ~installed:false ~unavailable:true
+      universe packages
+
+  let installable universe packages ~name =
     let packages =
-      OpamPackage.Set.union packages @@
-      OpamPackage.Set.of_list @@
-      OpamSolver.reverse_dependencies
-        ~depopts:false ~build:true ~post:true ~installed:false ~unavailable:true
-        universe packages
+      OpamPackage.Set.inter packages universe.OpamTypes.u_packages
     in
-    log "... %d related packages" (OpamPackage.Set.cardinal packages);
+    log "At %s: among %d packages..." name (OpamPackage.Set.cardinal packages);
     let%lwt installable =
       Lwt_preemptive.detach (OpamSolver.installable_subset universe) packages
     in
-    log "... of which %d installable"
+    log "... %d are installable"
       (OpamPackage.Set.cardinal installable);
     Lwt.return (packages, installable)
 
   let installability_check ancestor head gitstore packages =
+    let open OpamPackage.Set.Op in
+    let%lwt univ_before = get_universe gitstore ancestor ~name:"ANCESTOR" in
+    let%lwt univ_after = get_universe gitstore head ~name:"HEAD" in
+    let consider_packages =
+      reverse_dependencies univ_before packages ++
+      reverse_dependencies univ_after packages
+    in
+    log "Considering %d related packages"
+      (OpamPackage.Set.cardinal consider_packages);
     let%lwt packages_before, installable_before =
-      installable gitstore ancestor packages
+      installable univ_before consider_packages ~name:"ANCESTOR"
     in
     let%lwt packages_after, installable_after =
-      installable gitstore head packages
+      installable univ_after consider_packages ~name:"HEAD"
     in
-    let open OpamPackage.Set.Op in
     let fresh = packages_after -- packages_before in
     let broken_before = packages_before -- installable_before in
     let broken_after = packages_after -- installable_after in
