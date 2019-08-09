@@ -54,11 +54,12 @@ let replay_upgrade num =
                 branch dest_branch
                 ?message title
 
-let replay_check num =
+let replay_check nums =
   let%lwt gitstore = match%lwt RepoGit.get repo with
     | Ok r -> Lwt.return r
     | Error e -> Lwt.fail (Failure "Repository loading failed")
   in
+  Lwt_list.iter_p (fun num ->
   let%lwt pr = get_pr num >|= fun p ->
     let get_repo b = {
       repo =
@@ -80,7 +81,8 @@ let replay_check num =
     }
   in
   let%lwt report = PrChecks.run pr gitstore in
-  Github_comment.push_report ~name ~token ~report pr
+  Github_comment.push_report ~name ~token ~report pr )
+    nums
 
 let () =
   match Sys.argv.(1) with
@@ -89,7 +91,15 @@ let () =
     Lwt_main.run (replay_upgrade num)
   | "check" ->
     let num = int_of_string Sys.argv.(2) in
-    Lwt_main.run (replay_check num)
+    Lwt_main.run (replay_check [num])
+  | "check-bunch" ->
+    begin
+      match Array.to_list Sys.argv with
+      | [] | [_] -> assert false
+      | _ :: _ :: prs ->
+        let nums = List.rev_map int_of_string prs in
+        Lwt_main.run (replay_check nums)
+    end
   | _ ->
-    OpamConsole.msg "Usage: %s <upgrade|check> PR#\n" Sys.argv.(0);
+    OpamConsole.msg "Usage: %s <upgrade|check> PR# or %s check-bunch PR#...\n" Sys.argv.(0) Sys.argv.(0);
     exit 2
