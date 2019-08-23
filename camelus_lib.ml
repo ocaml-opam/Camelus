@@ -1041,11 +1041,11 @@ module PrChecks = struct
         installability_check ancestor head gitstore packages
       in
       Lwt.return (add_status stlint stinst,
-                  msglint ^ "\n\n---\n" ^ msginst)
+                  msglint ^ "\n\n---\n" ^ msginst ^ misc_files_body)
     with e ->
       log "Installability check failed: %s%s" (Printexc.to_string e)
         (Printexc.get_backtrace ());
-      Lwt.return (stlint, msglint)
+      Lwt.return (stlint, msglint ^ misc_files_body)
 
 end
 
@@ -1055,6 +1055,14 @@ module Github_comment = struct
   open Github_t
 
   let github_max_descr_length = 140
+
+  let github_mutex = Lwt_mutex.create ()
+  let run cmd =
+    Lwt.bind (Lwt_mutex.lock github_mutex)
+      (fun () ->
+         Lwt.finalize (fun () -> run cmd)
+           (fun () -> Lwt_mutex.unlock github_mutex; Lwt.return_unit)
+      )
 
   let make_status ~name ~token pr ?text status =
     let status = {
