@@ -54,6 +54,20 @@ let replay_upgrade num =
                 branch dest_branch
                 ?message title
 
+let get_unchecked_pr () =
+  let open Github.Monad in
+  run @@
+  let open_prs = Github.Pull.for_repo ~token ~state:`Open ~user:repo.user ~repo:repo.name () in
+  let res_stream =
+    Github.Stream.map (fun pr ->
+        let stream = Github.Issue.comments ~token ~user:repo.user ~repo:repo.name ~num:pr.pull_number () in
+        Github.Stream.find (fun { issue_comment_user = u; _ } -> u.user_login = conf.Conf.name) stream >>=
+        function | Some _ -> return []
+                 | None -> return [pr.pull_number]
+      ) open_prs
+  in
+  Github.Stream.to_list res_stream
+
 let replay_check nums =
   let%lwt gitstore = match%lwt RepoGit.get repo with
     | Ok r -> Lwt.return r
@@ -100,6 +114,7 @@ let () =
         let nums = List.rev_map int_of_string prs in
         Lwt_main.run (replay_check nums)
     end
+  | "auto" -> Lwt_main.run begin get_unchecked_pr () >>= replay_check end
   | _ ->
     OpamConsole.msg "Usage: %s <upgrade|check> PR# or %s check-bunch PR#...\n" Sys.argv.(0) Sys.argv.(0);
     exit 2
