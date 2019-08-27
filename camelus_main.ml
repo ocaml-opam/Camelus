@@ -21,6 +21,11 @@ open Camelus_lib
 
 let log fmt = OpamConsole.msg (fmt ^^ "\n%!")
 
+let () = Lwt.async_exception_hook :=
+    begin fun exn ->
+      log "Event async failed: %s" (Printexc.to_string exn)
+    end
+
 let handler conf gitstore = function
   | `Pr pr when List.mem `Pr_checker conf.Conf.roles ->
     (log "=> PR #%d received \
