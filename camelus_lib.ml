@@ -747,14 +747,17 @@ module PrChecks = struct
   let changed_opam_files ancestor head gitstore =
     let%lwt files = RepoGit.changed_files ancestor head gitstore in
     Lwt.return @@
-    OpamStd.List.filter_map (fun (s,c) ->
+    let opamfiles, others = List.partition (fun (s,c) ->
         match c with
         | Some c when
             OpamStd.String.starts_with ~prefix:"packages/" s &&
             OpamStd.String.ends_with ~suffix:"/opam" s
-          -> Some (OpamFilename.of_string s, c)
-        | _ -> None)
+          -> true
+        | _ -> false)
       files
+    in
+    List.map (function (s, Some c) -> (OpamFilename.of_string s, c) | (_,None) -> assert false) opamfiles,
+    List.map fst others
 
   let lint head gitstore opam_files =
     let%lwt lint =
@@ -1023,11 +1026,17 @@ module PrChecks = struct
     | `Warnings _ as w, _ | _, (`Warnings _ as w) -> w
     | `Passed, `Passed -> `Passed
 
+  let notice_misc_files = function
+    | [] -> ""
+    | l -> "\n\n---\n\n##### :sun_behind_small_cloud: " ^ (string_of_int @@ List.length l ) ^ " ignored non-opam files:\n\n" ^
+           OpamStd.Format.itemize ~bullet:"* " (fun s -> s) l
+
   let run pr gitstore =
     let%lwt () = RepoGit.fetch_pr pr gitstore in
     let head = pr.head.sha in
     let%lwt ancestor = RepoGit.common_ancestor pr gitstore in
-    let%lwt opam_files = changed_opam_files ancestor head gitstore in
+    let%lwt opam_files, other_files = changed_opam_files ancestor head gitstore in
+    let misc_files_body = notice_misc_files other_files in
     let%lwt (stlint,msglint) = lint head gitstore opam_files in
     let packages =
       List.fold_left (fun pkgs (f,_) -> match OpamPackage.of_filename f with
@@ -1041,11 +1050,11 @@ module PrChecks = struct
         installability_check ancestor head gitstore packages
       in
       Lwt.return (add_status stlint stinst,
-                  msglint ^ "\n\n---\n" ^ msginst)
+                  msglint ^ "\n\n---\n" ^ msginst ^ misc_files_body)
     with e ->
       log "Installability check failed: %s%s" (Printexc.to_string e)
         (Printexc.get_backtrace ());
-      Lwt.return (stlint, msglint)
+      Lwt.return (stlint, msglint ^ misc_files_body)
 
 end
 
@@ -1055,6 +1064,14 @@ module Github_comment = struct
   open Github_t
 
   let github_max_descr_length = 140
+
+  let github_mutex = Lwt_mutex.create ()
+  let run cmd =
+    Lwt.bind (Lwt_mutex.lock github_mutex)
+      (fun () ->
+         Lwt.finalize (fun () -> run cmd)
+           (fun () -> Lwt_mutex.unlock github_mutex; Lwt.return_unit)
+      )
 
   let make_status ~name ~token pr ?text status =
     let status = {
