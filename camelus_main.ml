@@ -35,7 +35,7 @@ let handler conf gitstore = function
        pr.head.repo.user pr.head.repo.name pr.head.ref
        pr.head.sha pr.base.sha;
      try%lwt
-       let%lwt report = PrChecks.run pr gitstore in
+       let%lwt report = PrChecks.run ~conf pr gitstore in
        Github_comment.push_report
          ~name:conf.Conf.name
          ~token:conf.Conf.token

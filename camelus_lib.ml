@@ -50,6 +50,89 @@ type push_event = {
   push_ancestor: string;
 }
 
+module Conf = struct
+  module C = struct
+    let internal = ".opam-ci"
+
+    type t = {
+      port: int;
+      name: string;
+      token: Github.Token.t;
+      secret: Cstruct.t;
+      repo: repo;
+      roles: [ `Pr_checker | `Push_upgrader ] list;
+      base_branch: string;
+      dest_branch: string;
+    }
+
+    let empty = {
+      port = 8122;
+      name = "opam-ci";
+      token = Github.Token.of_string "";
+      secret = Cstruct.of_string "";
+      repo = { user="ocaml"; name="opam-repository"; auth=None };
+      roles = [ `Pr_checker ];
+      base_branch = "master";
+      dest_branch = "2.0.0";
+    }
+
+    open OpamPp.Op
+
+    let role_of_string = function
+      | "pr_checker" -> `Pr_checker
+      | "push_upgrader" -> `Push_upgrader
+      | _ -> failwith "Invalid role (accepted are pr_checker, push_upgrader)"
+
+    let role_to_string = function
+      | `Pr_checker -> "pr_checker"
+      | `Push_upgrader -> "push_upgrader"
+
+    let fields = [
+      "port", OpamPp.ppacc (fun port t -> {t with port}) (fun t -> t.port)
+        OpamFormat.V.pos_int;
+      "name", OpamPp.ppacc (fun name t -> {t with name}) (fun t -> t.name)
+        OpamFormat.V.string;
+      "token", OpamPp.ppacc (fun token t -> {t with token}) (fun t -> t.token)
+        (OpamFormat.V.string -|
+         OpamPp.of_module "token" (module Github.Token));
+      "secret", OpamPp.ppacc
+        (fun secret t -> {t with secret}) (fun t -> t.secret)
+        (OpamFormat.V.string -|
+         OpamPp.of_pair "secret"
+           Cstruct.((of_string ?allocator:None ?off:None ?len:None), to_string));
+      "repo-user", OpamPp.ppacc
+        (fun user t -> {t with repo = {t.repo with user}})
+        (fun t -> t.repo.user)
+        OpamFormat.V.string;
+      "repo-name", OpamPp.ppacc
+        (fun name t -> {t with repo = {t.repo with name}})
+        (fun t -> t.repo.name)
+        OpamFormat.V.string;
+      "roles", OpamPp.ppacc
+        (fun roles t -> {t with roles })
+        (fun t -> t.roles)
+        (OpamFormat.V.map_list ~depth:1 @@
+         OpamFormat.V.ident -|
+         OpamPp.of_pair "role" (role_of_string, role_to_string));
+      "base-branch", OpamPp.ppacc
+        (fun base_branch t -> {t with base_branch })
+        (fun t -> t.base_branch)
+        OpamFormat.V.string;
+      "dest-branch", OpamPp.ppacc
+        (fun dest_branch t -> {t with dest_branch })
+        (fun t -> t.dest_branch)
+        OpamFormat.V.string;
+    ]
+
+    let pp =
+      OpamFormat.I.map_file @@
+      OpamFormat.I.fields ~name:internal ~empty fields -|
+      OpamFormat.I.show_errors ~name:internal ~strict:true ()
+  end
+  include C
+  include OpamFile.SyntaxFile(C)
+end
+
 module FdPool = struct
 
   let max_count = 50
@@ -1031,8 +1114,33 @@ module PrChecks = struct
     | l -> "\n\n---\n\n##### :sun_behind_small_cloud: " ^ (string_of_int @@ List.length l ) ^ " ignored non-opam files:\n\n" ^
            OpamStd.Format.itemize ~bullet:"* " (fun s -> s) l
 
-  let run pr gitstore =
+  let msg_header ~conf pr =
+    let%lwt hello_msg =
+      begin match pr.pr_user with
+        | "AltGr" -> Lwt.return "As you wish, master!"
+        | "kit-ty-kate" -> Lwt.return "Good to see you Madam."
+        | "thomasblanc" -> Lwt.return "Tom, are you trying to break me again?"
+        | user ->
+          Lwt.catch
+            (fun () ->
+               Github.Monad.run (Github.Stream.to_list @@ Github.Search.issues ~qualifiers:[`Author user; `Repo (conf.Conf.repo.user ^"/"^conf.Conf.repo.name);] ~keywords:[] ()) >>= function
+               | [] -> raise Not_found
+               | { Github_t.repository_issue_search_total_count = l; _ }::_ ->
+               Lwt.return @@
+               if l <= 1
+               then "I believe this is your first contribution here. Please be nice, reviewers!"
+               else if l <= 50
+               then Printf.sprintf "@%s has posted %d contributions." user l
+               else Printf.sprintf "A pull request by opam-seasoned @%s." user
+            )
+            (fun _ -> Lwt.return @@ Printf.sprintf "Hey @thomasblanc there is a bug in your code see logs for %d" pr.number)
+      end in
+    Lwt.return @@ Printf.sprintf "Commit: %s\n\n%s\n\n" pr.head.sha hello_msg
+
+
+  let run ~conf pr gitstore =
     let%lwt () = RepoGit.fetch_pr pr gitstore in
+    let%lwt msghead = msg_header ~conf pr in
     let head = pr.head.sha in
     let%lwt ancestor = RepoGit.common_ancestor pr gitstore in
     let%lwt opam_files, other_files = changed_opam_files ancestor head gitstore in
@@ -1050,11 +1158,11 @@ module PrChecks = struct
         installability_check ancestor head gitstore packages
       in
       Lwt.return (add_status stlint stinst,
-                  msglint ^ "\n\n---\n" ^ msginst ^ misc_files_body)
+                  msghead ^ msglint ^ "\n\n---\n" ^ msginst ^ misc_files_body)
     with e ->
       log "Installability check failed: %s%s" (Printexc.to_string e)
         (Printexc.get_backtrace ());
-      Lwt.return (stlint, msglint ^ misc_files_body)
+      Lwt.return (stlint, msghead ^ msglint ^ misc_files_body)
 
 end
 
@@ -1169,89 +1277,6 @@ module Github_comment = struct
       return (log "Filed pull-request #%d" resp#value.pull_number)
     )
 
-end
-
-module Conf = struct
-  module C = struct
-    let internal = ".opam-ci"
-
-    type t = {
-      port: int;
-      name: string;
-      token: Github.Token.t;
-      secret: Cstruct.t;
-      repo: repo;
-      roles: [ `Pr_checker | `Push_upgrader ] list;
-      base_branch: string;
-      dest_branch: string;
-    }
-
-    let empty = {
-      port = 8122;
-      name = "opam-ci";
-      token = Github.Token.of_string "";
-      secret = Cstruct.of_string "";
-      repo = { user="ocaml"; name="opam-repository"; auth=None };
-      roles = [ `Pr_checker ];
-      base_branch = "master";
-      dest_branch = "2.0.0";
-    }
-
-    open OpamPp.Op
-
-    let role_of_string = function
-      | "pr_checker" -> `Pr_checker
-      | "push_upgrader" -> `Push_upgrader
-      | _ -> failwith "Invalid role (accepted are pr_checker, push_upgrader)"
-
-    let role_to_string = function
-      | `Pr_checker -> "pr_checker"
-      | `Push_upgrader -> "push_upgrader"
-
-    let fields = [
-      "port", OpamPp.ppacc (fun port t -> {t with port}) (fun t -> t.port)
-        OpamFormat.V.pos_int;
-      "name", OpamPp.ppacc (fun name t -> {t with name}) (fun t -> t.name)
-        OpamFormat.V.string;
-      "token", OpamPp.ppacc (fun token t -> {t with token}) (fun t -> t.token)
-        (OpamFormat.V.string -|
-         OpamPp.of_module "token" (module Github.Token));
-      "secret", OpamPp.ppacc
-        (fun secret t -> {t with secret}) (fun t -> t.secret)
-        (OpamFormat.V.string -|
-         OpamPp.of_pair "secret"
-           Cstruct.((of_string ?allocator:None ?off:None ?len:None), to_string));
-      "repo-user", OpamPp.ppacc
-        (fun user t -> {t with repo = {t.repo with user}})
-        (fun t -> t.repo.user)
-        OpamFormat.V.string;
-      "repo-name", OpamPp.ppacc
-        (fun name t -> {t with repo = {t.repo with name}})
-        (fun t -> t.repo.name)
-        OpamFormat.V.string;
-      "roles", OpamPp.ppacc
-        (fun roles t -> {t with roles })
-        (fun t -> t.roles)
-        (OpamFormat.V.map_list ~depth:1 @@
-         OpamFormat.V.ident -|
-         OpamPp.of_pair "role" (role_of_string, role_to_string));
-      "base-branch", OpamPp.ppacc
-        (fun base_branch t -> {t with base_branch })
-        (fun t -> t.base_branch)
-        OpamFormat.V.string;
-      "dest-branch", OpamPp.ppacc
-        (fun dest_branch t -> {t with dest_branch })
-        (fun t -> t.dest_branch)
-        OpamFormat.V.string;
-    ]
-
-    let pp =
-      OpamFormat.I.map_file @@
-      OpamFormat.I.fields ~name:internal ~empty fields -|
-      OpamFormat.I.show_errors ~name:internal ~strict:true ()
-  end
-  include C
-  include OpamFile.SyntaxFile(C)
 end
 
 module Webhook_handler = struct

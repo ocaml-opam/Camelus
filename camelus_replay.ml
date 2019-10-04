@@ -62,8 +62,15 @@ let get_unchecked_pr () =
     Github.Stream.map (fun pr ->
         let stream = Github.Issue.comments ~token ~user:repo.user ~repo:repo.name ~num:pr.pull_number () in
         Github.Stream.find (fun { issue_comment_user = u; _ } -> u.user_login = conf.Conf.name) stream >>=
-        function | Some _ -> return []
-                 | None -> return [pr.pull_number]
+        function
+        | Some ({ issue_comment_body = b; _ },_) ->
+          begin try Scanf.sscanf b "Commit: %s\n"
+                (fun c ->
+                   if String.equal c pr.pull_head.branch_sha
+                   then return []
+                   else return [pr.pull_number])
+            with _ -> return [pr.pull_number] end
+        | None -> return [pr.pull_number]
       ) open_prs
   in
   Github.Stream.to_list res_stream
@@ -94,7 +101,7 @@ let replay_check nums =
       message = p.pull_title, p.pull_body;
     }
   in
-  let%lwt report = PrChecks.run pr gitstore in
+  let%lwt report = PrChecks.run ~conf pr gitstore in
   Github_comment.push_report ~name ~token ~report pr )
     nums
 
