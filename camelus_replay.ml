@@ -15,10 +15,10 @@ let base_branch = "master"
 let dest_branch = "2.0.0"
 
 let get_pr num =
-  Github.Monad.run @@
-  let open Github.Monad in
-    Github.Pull.get ~user:repo.user ~repo:repo.name ~num () >|=
-    Github.Response.value
+  GH.run (fun () ->
+      let open Github.Monad in
+      Github.Pull.get ~user:repo.user ~repo:repo.name ~num () >|=
+      Github.Response.value)
 
 open Lwt.Infix
 open Github_t

@@ -162,6 +162,14 @@ module FdPool = struct
 
 end
 
+module GH = struct
+
+  let mutex = Lwt_mutex.create ()
+
+  let run f = Lwt_mutex.with_lock mutex (fun () -> Github.Monad.run @@ f ())
+
+end
+
 module RepoGit = struct
 
   module M = OpamStd.String.Map
@@ -845,7 +853,7 @@ module PrChecks = struct
             OpamStd.String.ends_with ~suffix:"/opam" s
           -> true
         | _ -> false)
-      files
+        files
     in
     List.map (function (s, Some c) -> (OpamFilename.of_string s, c) | (_,None) -> assert false) opamfiles,
     List.map fst others
@@ -1131,15 +1139,15 @@ module PrChecks = struct
         | user ->
           Lwt.catch
             (fun () ->
-               Github.Monad.run (Github.Stream.to_list @@ Github.Search.issues ~qualifiers:[`Author user; `Repo (conf.Conf.repo.user ^"/"^conf.Conf.repo.name);] ~keywords:[] ()) >>= function
+               GH.run (fun () -> Github.Stream.to_list @@ Github.Search.issues ~qualifiers:[`Author user; `Repo (conf.Conf.repo.user ^"/"^conf.Conf.repo.name);] ~keywords:[] ()) >>= function
                | [] -> raise Not_found
                | { Github_t.repository_issue_search_total_count = l; _ }::_ ->
-               Lwt.return @@
-               if l <= 1
-               then "I believe this is your first contribution here. Please be nice, reviewers!"
-               else if l <= 50
-               then Printf.sprintf "@%s has posted %d contributions." user l
-               else Printf.sprintf "A pull request by opam-seasoned @%s." user
+                 Lwt.return @@
+                 if l <= 1
+                 then "I believe this is your first contribution here. Please be nice, reviewers!"
+                 else if l <= 50
+                 then Printf.sprintf "@%s has posted %d contributions." user l
+                 else Printf.sprintf "A pull request by opam-seasoned @%s." user
             )
             (fun _ -> Lwt.return @@ Printf.sprintf "Hey @thomasblanc there is a bug in your code see logs for %d" pr.number)
       end in
@@ -1181,14 +1189,6 @@ module Github_comment = struct
 
   let github_max_descr_length = 140
 
-  let github_mutex = Lwt_mutex.create ()
-  let run cmd =
-    Lwt.bind (Lwt_mutex.lock github_mutex)
-      (fun () ->
-         Lwt.finalize (fun () -> run cmd)
-           (fun () -> Lwt_mutex.unlock github_mutex; Lwt.return_unit)
-      )
-
   let make_status ~name ~token pr ?text status =
     let status = {
       new_status_state = status;
@@ -1201,7 +1201,7 @@ module Github_comment = struct
       ~status ~sha:pr.head.sha ()
 
   let push_status ~name ~token pr ?text status =
-    run (make_status ~name ~token pr ?text status)
+    GH.run (fun () -> make_status ~name ~token pr ?text status)
 
   let push_report ~name ~token ~report:(status,body) pr =
     let user = pr.base.repo.user in
@@ -1241,11 +1241,11 @@ module Github_comment = struct
       in
       make_status ~name ~token pr ~text state
     in
-    run (
-      comment () >>= fun _ ->
-      push_status () >>= fun _ ->
-      return (log "Comment posted back to PR #%d" pr.number);
-    )
+    GH.run (fun () ->
+        comment () >>= fun _ ->
+        push_status () >>= fun _ ->
+        return (log "Comment posted back to PR #%d" pr.number);
+      )
 
   let pull_request ~name ~token repo branch target_branch ?message title =
     log "Pull-requesting...";
@@ -1280,10 +1280,10 @@ module Github_comment = struct
         Github.Pull.update ~token ~user:repo.user ~repo:repo.name
           ~num:pr.pull_number ~update_pull ()
     in
-    run (
-      pr () >>= fun resp ->
-      return (log "Filed pull-request #%d" resp#value.pull_number)
-    )
+    GH.run (fun () ->
+        pr () >>= fun resp ->
+        return (log "Filed pull-request #%d" resp#value.pull_number)
+      )
 
 end
 
