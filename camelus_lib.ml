@@ -18,7 +18,15 @@
 
 open Lwt.Infix
 
-let log fmt = OpamConsole.msg (fmt ^^ "\n%!")
+let log_tag : string Lwt.key= Lwt.new_key ()
+
+let log fmt =
+  let tag =
+    match Lwt.get log_tag with
+    | None -> "??"
+    | Some s -> s
+  in
+  OpamConsole.msg ("[%s] "^^ fmt ^^ "\n%!") tag
 
 let verbose =
   try Sys.getenv "CAMELUS_VERBOSE" <> ""

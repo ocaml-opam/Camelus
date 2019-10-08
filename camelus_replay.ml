@@ -34,46 +34,47 @@ let replay_upgrade num =
     | _ -> failwith "No merge SHA found"
   in
   let merge_parent_sha = merge_sha^"^" in
-    log "Upgrading branch from %s to %s"
-      merge_parent_sha merge_sha;
-    let%lwt new_branch =
-      FormatUpgrade.run base_branch dest_branch
-        merge_parent_sha merge_sha gitstore
-        repo
+  log "Upgrading branch from %s to %s"
+    merge_parent_sha merge_sha;
+  let%lwt new_branch =
+    FormatUpgrade.run base_branch dest_branch
+      merge_parent_sha merge_sha gitstore
+      repo
+  in
+  match new_branch with
+  | None -> Lwt.return_unit
+  | Some (branch, msg) ->
+    let title, message =
+      match OpamStd.String.cut_at msg '\n' with
+      | Some (t, m) -> t, Some (String.trim m)
+      | None -> "Merge changes from 1.2 format repo", None
     in
-      match new_branch with
-        | None -> Lwt.return_unit
-        | Some (branch, msg) ->
-            let title, message =
-              match OpamStd.String.cut_at msg '\n' with
-                | Some (t, m) -> t, Some (String.trim m)
-                | None -> "Merge changes from 1.2 format repo", None
-            in
-              Github_comment.pull_request
-                ~name ~token repo
-                branch dest_branch
-                ?message title
+    Github_comment.pull_request
+      ~name ~token repo
+      branch dest_branch
+      ?message title
 
 let get_unchecked_pr () =
   let open Github.Monad in
-  run @@
-  let open_prs = Github.Pull.for_repo ~token ~state:`Open ~user:repo.user ~repo:repo.name () in
-  let res_stream =
-    Github.Stream.map (fun pr ->
-        let stream = Github.Issue.comments ~token ~user:repo.user ~repo:repo.name ~num:pr.pull_number () in
-        Github.Stream.find (fun { issue_comment_user = u; _ } -> u.user_login = conf.Conf.name) stream >>=
-        function
-        | Some ({ issue_comment_body = b; _ },_) ->
-          begin try Scanf.sscanf b "Commit: %s\n"
-                (fun c ->
-                   if String.equal c pr.pull_head.branch_sha
-                   then return []
-                   else return [pr.pull_number])
-            with _ -> return [pr.pull_number] end
-        | None -> return [pr.pull_number]
-      ) open_prs
-  in
-  Github.Stream.to_list res_stream
+  GH.run (fun () ->
+      let open_prs = Github.Pull.for_repo ~token ~state:`Open ~user:repo.user ~repo:repo.name () in
+      let res_stream =
+        Github.Stream.map (fun pr ->
+            let stream = Github.Issue.comments ~token ~user:repo.user ~repo:repo.name ~num:pr.pull_number () in
+            Github.Stream.find (fun { issue_comment_user = u; _ } -> u.user_login = conf.Conf.name) stream >>=
+            function
+            | Some ({ issue_comment_body = b; _ },_) ->
+              begin try Scanf.sscanf b "Commit: %s\n"
+                          (fun c ->
+                             if String.equal c pr.pull_head.branch_sha
+                             then return []
+                             else return [pr.pull_number])
+                with _ -> return [pr.pull_number] end
+            | None -> return [pr.pull_number]
+          ) open_prs
+      in
+      Github.Stream.to_list res_stream
+    )
 
 let replay_check nums =
   let%lwt gitstore = match%lwt RepoGit.get repo with
@@ -81,28 +82,30 @@ let replay_check nums =
     | Error e -> Lwt.fail (Failure "Repository loading failed")
   in
   Lwt_list.iter_p (fun num ->
-  let%lwt pr = get_pr num >|= fun p ->
-    let get_repo b = {
-      repo =
-        (match b.branch_repo with
-         | None -> repo
-         | Some gr -> {
-             user = gr.repository_owner.user_login;
-             name = gr.repository_name;
-             auth = None;
-           });
-      ref = b.branch_ref;
-      sha = b.branch_sha;
-    } in {
-      number = num;
-      base = get_repo p.pull_base;
-      head = get_repo p.pull_head;
-      pr_user = p.pull_user.user_login;
-      message = p.pull_title, p.pull_body;
-    }
-  in
-  let%lwt report = PrChecks.run ~conf pr gitstore in
-  Github_comment.push_report ~name ~token ~report pr )
+      Lwt.with_value log_tag (Some (string_of_int num)) (fun () ->
+          let%lwt pr = get_pr num >|= fun p ->
+            let get_repo b = {
+              repo =
+                (match b.branch_repo with
+                 | None -> repo
+                 | Some gr -> {
+                     user = gr.repository_owner.user_login;
+                     name = gr.repository_name;
+                     auth = None;
+                   });
+              ref = b.branch_ref;
+              sha = b.branch_sha;
+            } in {
+              number = num;
+              base = get_repo p.pull_base;
+              head = get_repo p.pull_head;
+              pr_user = p.pull_user.user_login;
+              message = p.pull_title, p.pull_body;
+            }
+          in
+          let%lwt report = PrChecks.run ~conf pr gitstore in
+          Github_comment.push_report ~name ~token ~report pr )
+    )
     nums
 
 let () =
@@ -112,7 +115,7 @@ let () =
     Lwt_main.run (replay_upgrade num)
   | "check" ->
     let num = int_of_string Sys.argv.(2) in
-    Lwt_main.run (replay_check [num])
+    Lwt_main.run (Lwt.with_value log_tag (Some Sys.argv.(2)) (fun () ->replay_check [num]))
   | "check-bunch" ->
     begin
       match Array.to_list Sys.argv with

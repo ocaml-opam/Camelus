@@ -28,27 +28,28 @@ let () = Lwt.async_exception_hook :=
 
 let handler conf gitstore = function
   | `Pr pr when List.mem `Pr_checker conf.Conf.roles ->
-    (log "=> PR #%d received \
-          (onto %s/%s#%s from %s/%s#%s, commit %s over %s)"
-       pr.number
-       pr.base.repo.user pr.base.repo.name pr.base.ref
-       pr.head.repo.user pr.head.repo.name pr.head.ref
-       pr.head.sha pr.base.sha;
-     try%lwt
-       let%lwt report = PrChecks.run ~conf pr gitstore in
-       Github_comment.push_report
-         ~name:conf.Conf.name
-         ~token:conf.Conf.token
-         ~report
-         pr
-     with exn ->
-       log "Check failed: %s" (Printexc.to_string exn);
-       let%lwt _ =
-         Github_comment.push_status
-           ~name:conf.Conf.name ~token:conf.Conf.token pr
-           ~text:"Could not complete" `Failure
-       in
-       Lwt.return_unit)
+    Lwt.with_value log_tag (Some (string_of_int pr.number))
+      (fun () -> log "=> PR #%d received \
+                      (onto %s/%s#%s from %s/%s#%s, commit %s over %s)"
+          pr.number
+          pr.base.repo.user pr.base.repo.name pr.base.ref
+          pr.head.repo.user pr.head.repo.name pr.head.ref
+          pr.head.sha pr.base.sha;
+        try%lwt
+          let%lwt report = PrChecks.run ~conf pr gitstore in
+          Github_comment.push_report
+            ~name:conf.Conf.name
+            ~token:conf.Conf.token
+            ~report
+            pr
+        with exn ->
+          log "Check failed: %s" (Printexc.to_string exn);
+          let%lwt _ =
+            Github_comment.push_status
+              ~name:conf.Conf.name ~token:conf.Conf.token pr
+              ~text:"Could not complete" `Failure
+          in
+          Lwt.return_unit)
   | `Push p when List.mem `Push_upgrader conf.Conf.roles ->
     (log "=> Push received (head %s onto %s)"
        p.push_head p.push_ancestor;
