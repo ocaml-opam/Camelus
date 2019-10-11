@@ -168,6 +168,96 @@ module GH = struct
 
   let run f = Lwt_mutex.with_lock mutex (fun () -> Github.Monad.run @@ f ())
 
+  type _ req =
+    | Count_previous_posts : pull_request -> int req
+    | Comment : pull_request * string -> unit req
+    | Status : (pull_request * Github_t.status_state * string option) -> unit req
+    | Pr : int -> Github_t.pull req
+    | Open_prs : Github_t.pull list req
+
+  type breq = R : 'a req * 'a Lwt.u -> breq
+
+  let eval : type a. Conf.t -> repo -> a req -> a Github.Monad.t =
+    fun conf repo req ->
+      let open Github.Monad in
+      let open Github_t in
+      let token = conf.Conf.token in
+      match req with
+      | Count_previous_posts { pr_user = user; number; _ } ->
+        let s = Github.Search.issues
+            ~qualifiers:[`Author user; `Repo (conf.Conf.repo.user ^"/"^conf.Conf.repo.name);]
+            ~keywords:[] ()
+        in
+        bind (function
+            | None -> return 0
+            | Some ({repository_issue_search_total_count = c}, _) -> return c
+          )
+          (Github.Stream.next s)
+      | Comment (pr,body) ->
+        begin
+          let user = pr.base.repo.user in
+          let repo = pr.base.repo.name in
+          let num = pr.number in
+          let rec find_comment stream =
+            Github.Stream.next stream >>= function
+            | Some (c, s) ->
+              if c.issue_comment_user.user_login = conf.name then return (Some c)
+              else find_comment s
+            | None -> return None
+          in
+          find_comment (Github.Issue.comments ~token ~user ~repo ~num ())
+          >>= function
+          | None ->
+            Github.Issue.create_comment ~token ~user ~repo ~num ~body ()
+          | Some { issue_comment_id = id; _ } ->
+            Github.Issue.update_comment ~token ~user ~repo ~id ~body ()
+        end >>= fun _ -> return ()
+      | Status (pr,status,text) ->
+        let status = {
+          new_status_state = status;
+          new_status_target_url = None;
+          new_status_description = text;
+          new_status_context = Some conf.Conf.name;
+        } in
+        Github.Status.create
+          ~token ~user:pr.base.repo.user ~repo:pr.base.repo.name
+          ~status ~sha:pr.head.sha ()
+          >>= fun _ -> return ()
+      | Pr num ->
+        Github.Pull.get ~user:repo.user ~repo:repo.name ~num () >|=
+        Github.Response.value
+      | Open_prs ->
+        Github.Pull.for_repo ~token ~state:`Open ~user:repo.user ~repo:repo.name ()
+        |> Github.Stream.to_list
+
+  let gh_stream, gh_push = Lwt_stream.create ()
+
+  let request : type a. a req -> a Lwt.t = fun req ->
+    let (promise, resolve) = Lwt.wait () in
+    gh_push ( Some ( R ( req, resolve ) ) );
+    promise
+
+  let loop ~conf () =
+    let step () =
+      match%lwt Lwt_stream.next gh_stream with
+      | exception exn ->
+        log "Event handler failed: %s" (Printexc.to_string exn);
+        Lwt.return (Github.Monad.return ())
+      | R ( req, resolve ) ->
+        let repo = conf.Conf.repo in
+        Lwt.return @@
+        ( let open Github.Monad in
+          catch
+            (fun () -> eval conf repo req >>= fun res ->
+              Lwt.wakeup_later resolve res; return () )
+            (fun exn -> Lwt.wakeup_later_exn resolve exn; return () ) )
+    in
+    let rec looper () =
+      let open Github.Monad in
+      step () |> embed |> bind (fun x -> x) >>= looper
+    in
+    run (fun () -> looper ())
+
 end
 
 module RepoGit = struct
@@ -1139,17 +1229,15 @@ module PrChecks = struct
         | user ->
           Lwt.catch
             (fun () ->
-               GH.run (fun () -> Github.Stream.to_list @@ Github.Search.issues ~qualifiers:[`Author user; `Repo (conf.Conf.repo.user ^"/"^conf.Conf.repo.name);] ~keywords:[] ()) >>= function
-               | [] -> raise Not_found
-               | { Github_t.repository_issue_search_total_count = l; _ }::_ ->
+               GH.request (Count_previous_posts pr) >>= fun l ->
                  Lwt.return @@
                  if l <= 1
-                 then "I believe this is your first contribution here. Please be nice, reviewers!"
+                 then Printf.sprintf "Hello @%s! I believe this is your first contribution here. Please be nice, reviewers!" user
                  else if l <= 50
                  then Printf.sprintf "@%s has posted %d contributions." user l
                  else Printf.sprintf "A pull request by opam-seasoned @%s." user
             )
-            (fun _ -> Lwt.return @@ Printf.sprintf "Hey @thomasblanc there is a bug in your code see logs for %d" pr.number)
+            (fun _ -> Lwt.return "I made an error retrieving the post by the user, sorry about that")
       end in
     Lwt.return @@ Printf.sprintf "Commit: %s\n\n%s\n\n" pr.head.sha hello_msg
 
@@ -1184,7 +1272,6 @@ end
 
 module Github_comment = struct
 
-  open Github.Monad
   open Github_t
 
   let github_max_descr_length = 140
@@ -1201,27 +1288,12 @@ module Github_comment = struct
       ~status ~sha:pr.head.sha ()
 
   let push_status ~name ~token pr ?text status =
-    GH.run (fun () -> make_status ~name ~token pr ?text status)
+    GH.request (Status ( pr, status, text))
 
   let push_report ~name ~token ~report:(status,body) pr =
-    let user = pr.base.repo.user in
-    let repo = pr.base.repo.name in
-    let num = pr.number in
     let comment () =
       log "Commenting...";
-      let rec find_comment stream =
-        Github.Stream.next stream >>= function
-        | Some (c, s) ->
-          if c.issue_comment_user.user_login = name then return (Some c)
-          else find_comment s
-        | None -> return None
-      in
-      find_comment (Github.Issue.comments ~token ~user ~repo ~num ())
-      >>= function
-      | None ->
-        Github.Issue.create_comment ~token ~user ~repo ~num ~body ()
-      | Some { issue_comment_id = id; _ } ->
-        Github.Issue.update_comment ~token ~user ~repo ~id ~body ()
+      GH.request @@ Comment (pr,body)
     in
     let push_status () =
       log "Pushing status...";
@@ -1239,51 +1311,50 @@ module Github_comment = struct
           if String.length m <= github_max_descr_length then m else
             Printf.sprintf "Errors for %d packages" (List.length ps)
       in
-      make_status ~name ~token pr ~text state
+      push_status ~name ~token pr ~text state
     in
-    GH.run (fun () ->
-        comment () >>= fun _ ->
-        push_status () >>= fun _ ->
-        return (log "Comment posted back to PR #%d" pr.number);
-      )
+    comment () >>= fun () ->
+    push_status () >>= fun () ->
+    Lwt.return (log "Comment posted back to PR #%d" pr.number)
 
-  let pull_request ~name ~token repo branch target_branch ?message title =
-    log "Pull-requesting...";
-    let pr () =
-      let rec find_pr stream =
-        Github.Stream.next stream >>= function
-        | Some (pr, s) ->
-          if pr.pull_head.branch_ref = branch &&
-             pr.pull_base.branch_ref = target_branch
-          then return (Some pr)
-          else find_pr s
-        | None -> return None
-      in
-      find_pr (Github.Pull.for_repo
-                 ~token ~state:`Open ~user:repo.user ~repo:repo.name ())
-      >>= function
-      | None ->
-        let pull = {
-          new_pull_title = title;
-          new_pull_body = message;
-          new_pull_base = target_branch;
-          new_pull_head = branch;
-        } in
-        Github.Pull.create ~token ~user:repo.user ~repo:repo.name ~pull ()
-      | Some pr ->
-        let update_pull = {
-          update_pull_title = Some title;
-          update_pull_body = message;
-          update_pull_state = None;
-          update_pull_base = None;
-        } in
-        Github.Pull.update ~token ~user:repo.user ~repo:repo.name
-          ~num:pr.pull_number ~update_pull ()
-    in
-    GH.run (fun () ->
-        pr () >>= fun resp ->
-        return (log "Filed pull-request #%d" resp#value.pull_number)
-      )
+  (* let pull_request ~name ~token repo branch target_branch ?message title =
+   *   let open Github.Monad in
+   *   log "Pull-requesting...";
+   *   let pr () =
+   *     let rec find_pr stream =
+   *       Github.Stream.next stream >>= function
+   *       | Some (pr, s) ->
+   *         if pr.pull_head.branch_ref = branch &&
+   *            pr.pull_base.branch_ref = target_branch
+   *         then return (Some pr)
+   *         else find_pr s
+   *       | None -> return None
+   *     in
+   *     find_pr (Github.Pull.for_repo
+   *                ~token ~state:`Open ~user:repo.user ~repo:repo.name ())
+   *     >>= function
+   *     | None ->
+   *       let pull = {
+   *         new_pull_title = title;
+   *         new_pull_body = message;
+   *         new_pull_base = target_branch;
+   *         new_pull_head = branch;
+   *       } in
+   *       Github.Pull.create ~token ~user:repo.user ~repo:repo.name ~pull ()
+   *     | Some pr ->
+   *       let update_pull = {
+   *         update_pull_title = Some title;
+   *         update_pull_body = message;
+   *         update_pull_state = None;
+   *         update_pull_base = None;
+   *       } in
+   *       Github.Pull.update ~token ~user:repo.user ~repo:repo.name
+   *         ~num:pr.pull_number ~update_pull ()
+   *   in
+   *   GH.run (fun () ->
+   *       pr () >>= fun resp ->
+   *       return (log "Filed pull-request #%d" resp#value.pull_number)
+   *     ) *)
 
 end
 
