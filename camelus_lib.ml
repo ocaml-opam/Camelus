@@ -173,7 +173,7 @@ module GH = struct
     | Comment : pull_request * string -> unit req
     | Status : (pull_request * Github_t.status_state * string option) -> unit req
     | Pr : int -> Github_t.pull req
-    | Open_prs : Github_t.pull list req
+    | Needing_check : int list req
 
   type breq = R : 'a req * 'a Lwt.u -> breq
 
@@ -226,9 +226,23 @@ module GH = struct
       | Pr num ->
         Github.Pull.get ~user:repo.user ~repo:repo.name ~num () >|=
         Github.Response.value
-      | Open_prs ->
-        Github.Pull.for_repo ~token ~state:`Open ~user:repo.user ~repo:repo.name ()
-        |> Github.Stream.to_list
+      | Needing_check ->
+        Github.Pull.for_repo ~token ~state:`Open ~user:conf.repo.user ~repo:conf.repo.name ()
+        |> Github.Stream.map (fun pr ->
+            let stream = Github.Issue.comments ~token ~user:repo.user ~repo:repo.name ~num:pr.pull_number () in
+            Github.Stream.find (fun { issue_comment_user = u; _ } -> u.user_login = conf.Conf.name) stream >>=
+            function
+            | Some ({ issue_comment_body = b; _ },_) ->
+              begin try Scanf.sscanf b "Commit: %s\n"
+                          (fun c ->
+                             if String.equal c pr.pull_head.branch_sha
+                             then return []
+                             else return [pr.pull_number])
+                with _ -> return [pr.pull_number] end
+            | None -> return [pr.pull_number]
+          )
+      |> Github.Stream.to_list
+
 
   let gh_stream, gh_push = Lwt_stream.create ()
 
