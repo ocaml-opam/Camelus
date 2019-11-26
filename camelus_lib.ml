@@ -164,13 +164,9 @@ end
 
 module GH = struct
 
-  let mutex = Lwt_mutex.create ()
-
-  let run f = Lwt_mutex.with_lock mutex (fun () -> Github.Monad.run @@ f ())
-
   type _ req =
     | Count_previous_posts : pull_request -> int req
-    | Comment : pull_request * string -> unit req
+    | Comment : pull_request * string -> string req
     | Status : (pull_request * Github_t.status_state * string option) -> unit req
     | Pr : int -> Github_t.pull req
     | Needing_check : int list req
@@ -211,7 +207,7 @@ module GH = struct
             Github.Issue.create_comment ~token ~user ~repo ~num ~body ()
           | Some { issue_comment_id = id; _ } ->
             Github.Issue.update_comment ~token ~user ~repo ~id ~body ()
-        end >>= fun _ -> return ()
+        end >>~ (fun { issue_comment_html_url = url; _ } -> return url)
       | Status (pr,status,text) ->
         let status = {
           new_status_state = status;
@@ -222,7 +218,7 @@ module GH = struct
         Github.Status.create
           ~token ~user:pr.base.repo.user ~repo:pr.base.repo.name
           ~status ~sha:pr.head.sha ()
-          >>= fun _ -> return ()
+          >>~ fun _ -> return ()
       | Pr num ->
         Github.Pull.get ~user:repo.user ~repo:repo.name ~num () >|=
         Github.Response.value
@@ -251,7 +247,7 @@ module GH = struct
     gh_push ( Some ( R ( req, resolve ) ) );
     promise
 
-  let loop ~conf () =
+  let loop ?(ntries=3) ?(retry_interval=60.) ~conf () =
     let step () =
       match%lwt Lwt_stream.next gh_stream with
       | exception exn ->
@@ -259,18 +255,23 @@ module GH = struct
         Lwt.return (Github.Monad.return ())
       | R ( req, resolve ) ->
         let repo = conf.Conf.repo in
-        Lwt.return @@
-        ( let open Github.Monad in
-          catch
-            (fun () -> eval conf repo req >>= fun res ->
-              Lwt.wakeup_later resolve res; return () )
-            (fun exn -> Lwt.wakeup_later_exn resolve exn; return () ) )
+        let rec evaln n =
+          ( let open Github.Monad in
+            catch
+              (fun () -> eval conf repo req >>= fun res ->
+                Lwt.wakeup_later resolve res; return () )
+              (fun exn ->
+                 if n > 0
+                 then ( embed (Lwt_unix.sleep retry_interval) >>= fun () -> evaln (pred n) )
+                 else ( Lwt.wakeup_later_exn resolve exn; return () ) ) )
+        in
+        Lwt.return @@ evaln ntries
     in
     let rec looper () =
       let open Github.Monad in
       step () |> embed |> bind (fun x -> x) >>= looper
     in
-    run (fun () -> looper ())
+    Github.Monad.run @@ looper ()
 
 end
 
@@ -1307,7 +1308,8 @@ module Github_comment = struct
   let push_report ~name ~token ~report:(status,body) pr =
     let comment () =
       log "Commenting...";
-      GH.request @@ Comment (pr,body)
+      GH.request @@ Comment (pr,body) >>= fun cmturl ->
+      Lwt.return @@ log "Comment posted on %s" cmturl
     in
     let push_status () =
       log "Pushing status...";
