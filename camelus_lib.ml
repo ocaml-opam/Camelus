@@ -71,6 +71,7 @@ module Conf = struct
       roles: [ `Pr_checker | `Push_upgrader ] list;
       base_branch: string;
       dest_branch: string;
+      camelus_child_loc : string;
     }
 
     let empty = {
@@ -82,6 +83,7 @@ module Conf = struct
       roles = [ `Pr_checker ];
       base_branch = "master";
       dest_branch = "2.0.0";
+      camelus_child_loc = "./camelus_child.native";
     }
 
     open OpamPp.Op
@@ -130,6 +132,9 @@ module Conf = struct
         (fun dest_branch t -> {t with dest_branch })
         (fun t -> t.dest_branch)
         OpamFormat.V.string;
+      "child-process", OpamPp.ppacc (fun camelus_child_loc t -> {t with camelus_child_loc}) (fun t -> t.camelus_child_loc)
+        OpamFormat.V.string;
+
     ]
 
     let pp =
@@ -173,71 +178,100 @@ module GH = struct
 
   type breq = R : 'a req * 'a Lwt.u -> breq
 
+  let count_previous_posts conf { pr_user = user; number; _ } =
+    let open Github.Monad in
+    let open Github_t in
+    let s = Github.Search.issues
+        ~qualifiers:[`Author user;
+                     `Repo (conf.Conf.repo.user ^"/"^conf.Conf.repo.name);]
+        ~keywords:[] ()
+    in
+    bind (function
+        | None -> return 0
+        | Some ({repository_issue_search_total_count = c}, _) -> return c
+      )
+      (Github.Stream.next s)
+
+  let comment conf pr body =
+    let open Github.Monad in
+    let open Github_t in
+    let token = conf.Conf.token in
+    let user = pr.base.repo.user in
+    let repo = pr.base.repo.name in
+    let num = pr.number in
+    let rec find_comment stream =
+      Github.Stream.next stream >>= function
+      | Some (c, s) ->
+        if c.issue_comment_user.user_login = conf.name then return (Some c)
+        else find_comment s
+      | None -> return None
+    in
+    begin
+      find_comment (Github.Issue.comments ~token ~user ~repo ~num ())
+      >>= function
+      | None ->
+        Github.Issue.create_comment ~token ~user ~repo ~num ~body ()
+      | Some { issue_comment_id = id; _ } ->
+        Github.Issue.update_comment ~token ~user ~repo ~id ~body ()
+    end >>~ (fun { issue_comment_html_url = url; _ } -> return url)
+
+  let status conf pr status text =
+      let open Github.Monad in
+      let open Github_t in
+      let token = conf.Conf.token in
+      let status = {
+        new_status_state = status;
+        new_status_target_url = None;
+        new_status_description = text;
+        new_status_context = Some conf.Conf.name;
+      } in
+      Github.Status.create
+        ~token ~user:pr.base.repo.user ~repo:pr.base.repo.name
+        ~status ~sha:pr.head.sha ()
+      >>~ fun _ -> return ()
+
+  let pr conf repo num =
+    let open Github.Monad in
+    let open Github_t in
+    Github.Pull.get ~user:repo.user ~repo:repo.name ~num () >|=
+    Github.Response.value
+
+  let needing_check conf repo =
+    let open Github.Monad in
+    let open Github_t in
+    let token = conf.Conf.token in
+    Github.Pull.for_repo
+      ~token ~state:`Open ~user:conf.repo.user ~repo:conf.repo.name ()
+    |> Github.Stream.map (fun pr ->
+        let stream = Github.Issue.comments
+            ~token ~user:repo.user ~repo:repo.name ~num:pr.pull_number ()
+        in
+        Github.Stream.find
+          (fun { issue_comment_user = u; _ } -> u.user_login = conf.Conf.name)
+          stream
+        >>= function
+        | Some ({ issue_comment_body = b; _ },_) ->
+          begin
+            try Scanf.sscanf b "Commit: %s\n"
+                  (fun c ->
+                     if String.equal c pr.pull_head.branch_sha
+                     then return []
+                     else return [pr.pull_number])
+            with _ -> return [pr.pull_number] end
+        | None -> return [pr.pull_number]
+      )
+    |> Github.Stream.to_list
+
   let eval : type a. Conf.t -> repo -> a req -> a Github.Monad.t =
     fun conf repo req ->
       let open Github.Monad in
       let open Github_t in
-      let token = conf.Conf.token in
       match req with
-      | Count_previous_posts { pr_user = user; number; _ } ->
-        let s = Github.Search.issues
-            ~qualifiers:[`Author user; `Repo (conf.Conf.repo.user ^"/"^conf.Conf.repo.name);]
-            ~keywords:[] ()
-        in
-        bind (function
-            | None -> return 0
-            | Some ({repository_issue_search_total_count = c}, _) -> return c
-          )
-          (Github.Stream.next s)
-      | Comment (pr,body) ->
-        begin
-          let user = pr.base.repo.user in
-          let repo = pr.base.repo.name in
-          let num = pr.number in
-          let rec find_comment stream =
-            Github.Stream.next stream >>= function
-            | Some (c, s) ->
-              if c.issue_comment_user.user_login = conf.name then return (Some c)
-              else find_comment s
-            | None -> return None
-          in
-          find_comment (Github.Issue.comments ~token ~user ~repo ~num ())
-          >>= function
-          | None ->
-            Github.Issue.create_comment ~token ~user ~repo ~num ~body ()
-          | Some { issue_comment_id = id; _ } ->
-            Github.Issue.update_comment ~token ~user ~repo ~id ~body ()
-        end >>~ (fun { issue_comment_html_url = url; _ } -> return url)
-      | Status (pr,status,text) ->
-        let status = {
-          new_status_state = status;
-          new_status_target_url = None;
-          new_status_description = text;
-          new_status_context = Some conf.Conf.name;
-        } in
-        Github.Status.create
-          ~token ~user:pr.base.repo.user ~repo:pr.base.repo.name
-          ~status ~sha:pr.head.sha ()
-          >>~ fun _ -> return ()
-      | Pr num ->
-        Github.Pull.get ~user:repo.user ~repo:repo.name ~num () >|=
-        Github.Response.value
-      | Needing_check ->
-        Github.Pull.for_repo ~token ~state:`Open ~user:conf.repo.user ~repo:conf.repo.name ()
-        |> Github.Stream.map (fun pr ->
-            let stream = Github.Issue.comments ~token ~user:repo.user ~repo:repo.name ~num:pr.pull_number () in
-            Github.Stream.find (fun { issue_comment_user = u; _ } -> u.user_login = conf.Conf.name) stream >>=
-            function
-            | Some ({ issue_comment_body = b; _ },_) ->
-              begin try Scanf.sscanf b "Commit: %s\n"
-                          (fun c ->
-                             if String.equal c pr.pull_head.branch_sha
-                             then return []
-                             else return [pr.pull_number])
-                with _ -> return [pr.pull_number] end
-            | None -> return [pr.pull_number]
-          )
-      |> Github.Stream.to_list
+      | Count_previous_posts pr -> count_previous_posts conf pr
+      | Comment (pr,body) -> comment conf pr body
+      | Status (pr,s,text) -> status conf pr s text
+      | Pr num -> pr conf repo num
+      | Needing_check -> needing_check conf repo
 
 
   let gh_stream, gh_push = Lwt_stream.create ()
@@ -1256,9 +1290,7 @@ module PrChecks = struct
       end in
     Lwt.return @@ Printf.sprintf "Commit: %s\n\n%s\n\n" pr.head.sha hello_msg
 
-
-  let run ~conf pr gitstore =
-    let%lwt () = RepoGit.fetch_pr pr gitstore in
+  let run_nogit ~conf pr gitstore =
     let%lwt msghead = msg_header ~conf pr in
     let head = pr.head.sha in
     let%lwt ancestor = RepoGit.common_ancestor pr gitstore in
@@ -1283,6 +1315,9 @@ module PrChecks = struct
         (Printexc.get_backtrace ());
       Lwt.return (stlint, msghead ^ msglint ^ misc_files_body)
 
+  let run ~conf pr gitstore =
+    let%lwt () = RepoGit.fetch_pr pr gitstore in
+    run_nogit ~conf pr gitstore
 end
 
 module Github_comment = struct
@@ -1291,19 +1326,34 @@ module Github_comment = struct
 
   let github_max_descr_length = 140
 
-  let make_status ~name ~token pr ?text status =
-    let status = {
-      new_status_state = status;
-      new_status_target_url = None;
-      new_status_description = text;
-      new_status_context = Some name;
-    } in
-    Github.Status.create
-      ~token ~user:pr.base.repo.user ~repo:pr.base.repo.name
-      ~status ~sha:pr.head.sha ()
+  (* let make_status ~name ~token pr ?text status =
+   *   let status = {
+   *     new_status_state = status;
+   *     new_status_target_url = None;
+   *     new_status_description = text;
+   *     new_status_context = Some name;
+   *   } in
+   *   Github.Status.create
+   *     ~token ~user:pr.base.repo.user ~repo:pr.base.repo.name
+   *     ~status ~sha:pr.head.sha () *)
 
   let push_status ~name ~token pr ?text status =
     GH.request (Status ( pr, status, text))
+
+  let make_status = function
+    | `Passed ->
+      `Success, "All tests passed"
+    | `Warnings ps ->
+      `Success,
+      let m = "Warnings for "^String.concat ", " ps in
+      if String.length m <= github_max_descr_length then m else
+        Printf.sprintf "Warnings for %d packages" (List.length ps)
+    | `Errors ps ->
+      `Error,
+      let m = "Errors for "^String.concat ", " ps in
+      if String.length m <= github_max_descr_length then m else
+        Printf.sprintf "Errors for %d packages" (List.length ps)
+
 
   let push_report ~name ~token ~report:(status,body) pr =
     let comment () =
@@ -1522,4 +1572,92 @@ module Webhook_handler = struct
       ~on_exn:(fun e -> log "Server exn: %s" (Printexc.to_string e))
       ~mode:(`TCP (`Port port))
       (Server.make ~callback ())
+end
+
+module Fork_handler = struct
+
+  let forktable : (int,unit Lwt.t * Lwt_process.process_none) Hashtbl.t = Hashtbl.create 111
+
+  let linearize_repo { user; name; auth; } =
+    match auth with
+    | None -> [| user; name; ""; "" |]
+    | Some (a,b) -> [| user; name; a; b |]
+  let delinearize_repo a offset =
+    { user = a.(offset); name = a.(offset+1);
+      auth =
+        match a.(offset+2), a.(offset+3) with
+        | "","" ->  None
+        | a,b -> Some (a,b) }
+
+  let l_repo = 4
+
+  let linearize_full_ref { repo; ref; sha } =
+    Array.append (linearize_repo repo) [| ref; sha; |]
+  let delinearize_full_ref a offset =
+    { repo = delinearize_repo a offset;
+      ref = a.(offset+l_repo);
+      sha = a.(offset+l_repo+1);
+    }
+  let l_fr = l_repo + 2
+
+  let linearize_pr { number; base; head; pr_user; message = a,b; } =
+    Array.concat [
+      [| string_of_int number |];
+      (linearize_full_ref base);
+      (linearize_full_ref head);
+      [|pr_user;a;b|]
+    ]
+  let delinearize_pr a offset =
+    {
+      number = int_of_string a.(offset);
+      base = delinearize_full_ref a (succ offset);
+      head = delinearize_full_ref a (succ offset + l_fr);
+      pr_user = a.(succ offset + l_fr + l_fr);
+      message = (a.(offset + l_fr + l_fr + 2), a.(offset + l_fr + l_fr + 3));
+    }
+
+  let gen_args conf pr =
+    Array.append [|conf.Conf.camelus_child_loc|] @@
+    linearize_pr pr
+
+  let process ~conf pr =
+    let commit = pr.head.sha in
+    let num = pr.number in
+    begin
+      match Hashtbl.find_opt forktable num with
+      | None -> Lwt.return_unit
+      | Some (old_promise, old_process) ->
+        old_process#terminate;
+        Lwt.catch (fun () -> old_promise) (fun _ -> Lwt.return_unit)
+    end >>= fun () ->
+    let process =
+      new Lwt_process.process_none
+        (conf.Conf.camelus_child_loc,
+         Array.append
+           [|conf.Conf.camelus_child_loc|]
+           (linearize_pr pr)
+        )
+    in
+    let waiter,wakener = Lwt.wait () in
+    let promise =
+      Lwt.finalize
+        (fun () -> waiter >>=
+          fun () -> process#status >>=
+          fun stat -> (
+            match stat with
+            | Unix.WEXITED e ->
+              log "pr %d commit %s handled, exit status %d" num commit e
+            | Unix.WSIGNALED s ->
+              log "pr %d commit %s killed, signal %d" num commit s
+            | Unix.WSTOPPED s ->
+              log "pr %d commit %s stopped, signal %d" num commit s
+          );
+          Lwt.return_unit)
+        (fun () -> Hashtbl.remove forktable num; Lwt.return_unit)
+    in
+    Hashtbl.replace forktable num (promise,process);
+    Lwt.wakeup_later wakener ();
+    Lwt.return_unit
+
+
 end

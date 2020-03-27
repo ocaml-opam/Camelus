@@ -53,6 +53,32 @@ open Github_t
 
 let get_unchecked_pr () = GH.(request Needing_check)
 
+let replay_pr_fork gitstore num =
+  Lwt.with_value log_tag (Some (string_of_int num)) (fun () ->
+      let%lwt pr = get_pr num >|= fun p ->
+        let get_repo b = {
+          repo =
+            (match b.branch_repo with
+             | None -> repo
+             | Some gr -> {
+                 user = gr.repository_owner.user_login;
+                 name = gr.repository_name;
+                 auth = None;
+               });
+          ref = b.branch_ref;
+          sha = b.branch_sha;
+        } in {
+          number = num;
+          base = get_repo p.pull_base;
+          head = get_repo p.pull_head;
+          pr_user = p.pull_user.user_login;
+          message = p.pull_title, p.pull_body;
+        }
+      in
+      RepoGit.fetch_pr pr gitstore >>= fun () ->
+      Fork_handler.process ~conf pr)
+
+
 let replay_check nums =
   let%lwt gitstore = match%lwt RepoGit.get repo with
     | Ok r -> Lwt.return r
@@ -102,6 +128,14 @@ let () =
         Lwt_main.run (replay_check nums)
     end
   | "auto" -> Lwt_main.run begin get_unchecked_pr () >>= replay_check end
+  | "autofork" -> Lwt_main.run begin
+      get_unchecked_pr () >>= fun l ->
+      let%lwt gitstore = match%lwt RepoGit.get repo with
+        | Ok r -> Lwt.return r
+        | Error e -> Lwt.fail (Failure "Repository loading failed")
+      in
+      Lwt_list.iter_p (replay_pr_fork gitstore) l
+    end
   | _ ->
     OpamConsole.msg "Usage: %s auto or %s check PR# or %s check-bunch PR#...\n" Sys.argv.(0) Sys.argv.(0) Sys.argv.(0);
     exit 2
