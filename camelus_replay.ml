@@ -134,7 +134,8 @@ let () =
         | Ok r -> Lwt.return r
         | Error e -> Lwt.fail (Failure "Repository loading failed")
       in
-      Lwt_list.iter_p (replay_pr_fork gitstore) l
+      Lwt_list.iter_p (replay_pr_fork gitstore) l >>= fun () ->
+      Lwt.join @@ Fork_handler.pending_processes ()
     end
   | _ ->
     OpamConsole.msg "Usage: %s auto or %s check PR# or %s check-bunch PR#...\n" Sys.argv.(0) Sys.argv.(0) Sys.argv.(0);

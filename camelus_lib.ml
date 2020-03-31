@@ -1290,8 +1290,7 @@ module PrChecks = struct
       end in
     Lwt.return @@ Printf.sprintf "Commit: %s\n\n%s\n\n" pr.head.sha hello_msg
 
-  let run_nogit ~conf pr gitstore =
-    let%lwt msghead = msg_header ~conf pr in
+  let run_nogit ~conf pr gitstore msghead =
     let head = pr.head.sha in
     let%lwt ancestor = RepoGit.common_ancestor pr gitstore in
     let%lwt opam_files, other_files = changed_opam_files ancestor head gitstore in
@@ -1317,7 +1316,8 @@ module PrChecks = struct
 
   let run ~conf pr gitstore =
     let%lwt () = RepoGit.fetch_pr pr gitstore in
-    run_nogit ~conf pr gitstore
+    let%lwt msghead = msg_header ~conf pr in
+    run_nogit ~conf pr gitstore msghead
 end
 
 module Github_comment = struct
@@ -1576,7 +1576,8 @@ end
 
 module Fork_handler = struct
 
-  let forktable : (int,unit Lwt.t * Lwt_process.process_none) Hashtbl.t = Hashtbl.create 111
+  let forktable : (int,unit Lwt.t * Lwt_process.process_out) Hashtbl.t =
+    Hashtbl.create 111
 
   let linearize_repo { user; name; auth; } =
     match auth with
@@ -1617,8 +1618,12 @@ module Fork_handler = struct
     }
 
   let gen_args conf pr =
-    Array.append [|conf.Conf.camelus_child_loc|] @@
-    linearize_pr pr
+    let%lwt msghead = PrChecks.msg_header ~conf pr in
+    Lwt.return @@
+    (conf.Conf.camelus_child_loc,
+     Array.concat [ [|conf.Conf.camelus_child_loc|];
+                   linearize_pr pr;
+                   [|msghead|]; ] )
 
   let process ~conf pr =
     let commit = pr.head.sha in
@@ -1630,13 +1635,11 @@ module Fork_handler = struct
         old_process#terminate;
         Lwt.catch (fun () -> old_promise) (fun _ -> Lwt.return_unit)
     end >>= fun () ->
+    let%lwt args = gen_args conf pr in
     let process =
-      new Lwt_process.process_none
-        (conf.Conf.camelus_child_loc,
-         Array.append
-           [|conf.Conf.camelus_child_loc|]
-           (linearize_pr pr)
-        )
+      Lwt_process.open_process_out
+        ~stdout:`Keep ~stderr:`Keep
+        args
     in
     let waiter,wakener = Lwt.wait () in
     let promise =
@@ -1659,5 +1662,7 @@ module Fork_handler = struct
     Lwt.wakeup_later wakener ();
     Lwt.return_unit
 
+  let pending_processes () =
+    Hashtbl.fold (fun _ (p,_) l -> p::l) forktable []
 
 end
