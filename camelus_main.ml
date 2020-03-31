@@ -36,12 +36,14 @@ let handler conf gitstore = function
           pr.head.repo.user pr.head.repo.name pr.head.ref
           pr.head.sha pr.base.sha;
         try%lwt
-          let%lwt report = PrChecks.run ~conf pr gitstore in
-          Github_comment.push_report
-            ~name:conf.Conf.name
-            ~token:conf.Conf.token
-            ~report
-            pr
+          (* let%lwt report = PrChecks.run ~conf pr gitstore in
+           * Github_comment.push_report
+           *   ~name:conf.Conf.name
+           *   ~token:conf.Conf.token
+           *   ~report
+           *   pr *)
+          RepoGit.fetch_pr pr gitstore >>= fun () ->
+          Fork_handler.process ~conf pr
         with exn ->
           log "Check failed: %s" (Printexc.to_string exn);
           let%lwt _ =
