@@ -146,20 +146,43 @@ module Conf = struct
   include OpamFile.SyntaxFile(C)
 end
 
+module Semaphore = struct
+
+  type t =
+    {
+      max_count : int;
+      mutable curr_count : int;
+      signal : unit Lwt_condition.t;
+    }
+
+  let make max_count =
+    { max_count; curr_count = 0;
+      signal = Lwt_condition.create (); }
+
+  let obtain x =
+    let go () =
+      x.curr_count <- succ x.curr_count;
+      Lwt.return_unit
+    in
+    if x.curr_count < x.max_count
+    then go ()
+    else ( Lwt_condition.wait x.signal >>= fun () -> go () )
+
+  let release x =
+    x.curr_count <- pred x.curr_count;
+    Lwt_condition.signal x.signal ()
+
+end
+
 module FdPool = struct
 
   let max_count = 50
-  let curr_count = ref 0
 
-  let c : unit Lwt_condition.t = Lwt_condition.create ()
+  let c = Semaphore.make max_count
 
-  let fd_use () =
-    if !curr_count < max_count
-    then ( incr curr_count; Lwt.return_unit )
-    else ( Lwt_condition.wait c >>= fun () -> incr curr_count; Lwt.return_unit )
+  let fd_use () = Semaphore.obtain c
 
-  let fd_free () =
-    decr curr_count; Lwt_condition.signal c ()
+  let fd_free () = Semaphore.release c
 
   let with_fd (f : unit -> 'a Lwt.t) : 'a Lwt.t =
     begin fd_use () >>= f end
@@ -1579,6 +1602,8 @@ module Fork_handler = struct
   let forktable : (int,unit Lwt.t * Lwt_process.process_out) Hashtbl.t =
     Hashtbl.create 111
 
+  let fork_sema = Semaphore.make 20
+
   let linearize_repo { user; name; auth; } =
     match auth with
     | None -> [| user; name; ""; "" |]
@@ -1636,6 +1661,7 @@ module Fork_handler = struct
         Lwt.catch (fun () -> old_promise) (fun _ -> Lwt.return_unit)
     end >>= fun () ->
     let%lwt args = gen_args conf pr in
+    let%lwt () = Semaphore.obtain fork_sema in
     let process =
       Lwt_process.open_process_out
         ~stdout:`Keep ~stderr:`Keep
@@ -1656,7 +1682,10 @@ module Fork_handler = struct
               log "pr %d commit %s stopped, signal %d" num commit s
           );
           Lwt.return_unit)
-        (fun () -> Hashtbl.remove forktable num; Lwt.return_unit)
+        (fun () ->
+           Hashtbl.remove forktable num;
+           Semaphore.release fork_sema;
+           Lwt.return_unit)
     in
     Hashtbl.replace forktable num (promise,process);
     Lwt.wakeup_later wakener ();
