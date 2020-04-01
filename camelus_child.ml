@@ -1,5 +1,7 @@
 open Camelus_lib
 
+let () = log "here"
+
 let conf = Conf.read (OpamFile.make (OpamFilename.of_string "opam-ci.conf"))
 
 let name = conf.Conf.name
