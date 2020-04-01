@@ -18,7 +18,15 @@
 
 open Lwt.Infix
 
-let log fmt = OpamConsole.msg (fmt ^^ "\n%!")
+let log_tag : string Lwt.key= Lwt.new_key ()
+
+let log fmt =
+  let tag =
+    match Lwt.get log_tag with
+    | None -> "??"
+    | Some s -> s
+  in
+  OpamConsole.msg ("[%s] "^^ fmt ^^ "\n%!") tag
 
 let verbose =
   try Sys.getenv "CAMELUS_VERBOSE" <> ""
@@ -50,24 +58,277 @@ type push_event = {
   push_ancestor: string;
 }
 
+module Conf = struct
+  module C = struct
+    let internal = ".opam-ci"
+
+    type t = {
+      port: int;
+      name: string;
+      token: Github.Token.t;
+      secret: Cstruct.t;
+      repo: repo;
+      roles: [ `Pr_checker | `Push_upgrader ] list;
+      base_branch: string;
+      dest_branch: string;
+      camelus_child_loc : string;
+    }
+
+    let empty = {
+      port = 8122;
+      name = "opam-ci";
+      token = Github.Token.of_string "";
+      secret = Cstruct.of_string "";
+      repo = { user="ocaml"; name="opam-repository"; auth=None };
+      roles = [ `Pr_checker ];
+      base_branch = "master";
+      dest_branch = "2.0.0";
+      camelus_child_loc = "./camelus_child.native";
+    }
+
+    open OpamPp.Op
+
+    let role_of_string = function
+      | "pr_checker" -> `Pr_checker
+      | "push_upgrader" -> `Push_upgrader
+      | _ -> failwith "Invalid role (accepted are pr_checker, push_upgrader)"
+
+    let role_to_string = function
+      | `Pr_checker -> "pr_checker"
+      | `Push_upgrader -> "push_upgrader"
+
+    let fields = [
+      "port", OpamPp.ppacc (fun port t -> {t with port}) (fun t -> t.port)
+        OpamFormat.V.pos_int;
+      "name", OpamPp.ppacc (fun name t -> {t with name}) (fun t -> t.name)
+        OpamFormat.V.string;
+      "token", OpamPp.ppacc (fun token t -> {t with token}) (fun t -> t.token)
+        (OpamFormat.V.string -|
+         OpamPp.of_module "token" (module Github.Token));
+      "secret", OpamPp.ppacc
+        (fun secret t -> {t with secret}) (fun t -> t.secret)
+        (OpamFormat.V.string -|
+         OpamPp.of_pair "secret"
+           Cstruct.((of_string ?allocator:None ?off:None ?len:None), to_string));
+      "repo-user", OpamPp.ppacc
+        (fun user t -> {t with repo = {t.repo with user}})
+        (fun t -> t.repo.user)
+        OpamFormat.V.string;
+      "repo-name", OpamPp.ppacc
+        (fun name t -> {t with repo = {t.repo with name}})
+        (fun t -> t.repo.name)
+        OpamFormat.V.string;
+      "roles", OpamPp.ppacc
+        (fun roles t -> {t with roles })
+        (fun t -> t.roles)
+        (OpamFormat.V.map_list ~depth:1 @@
+         OpamFormat.V.ident -|
+         OpamPp.of_pair "role" (role_of_string, role_to_string));
+      "base-branch", OpamPp.ppacc
+        (fun base_branch t -> {t with base_branch })
+        (fun t -> t.base_branch)
+        OpamFormat.V.string;
+      "dest-branch", OpamPp.ppacc
+        (fun dest_branch t -> {t with dest_branch })
+        (fun t -> t.dest_branch)
+        OpamFormat.V.string;
+      "child-process", OpamPp.ppacc (fun camelus_child_loc t -> {t with camelus_child_loc}) (fun t -> t.camelus_child_loc)
+        OpamFormat.V.string;
+
+    ]
+
+    let pp =
+      OpamFormat.I.map_file @@
+      OpamFormat.I.fields ~name:internal ~empty fields -|
+      OpamFormat.I.show_errors ~name:internal ~strict:true ()
+  end
+  include C
+  include OpamFile.SyntaxFile(C)
+end
+
+module Semaphore = struct
+
+  type t =
+    {
+      max_count : int;
+      mutable curr_count : int;
+      signal : unit Lwt_condition.t;
+    }
+
+  let make max_count =
+    { max_count; curr_count = 0;
+      signal = Lwt_condition.create (); }
+
+  let obtain x =
+    let go () =
+      x.curr_count <- succ x.curr_count;
+      Lwt.return_unit
+    in
+    if x.curr_count < x.max_count
+    then go ()
+    else ( Lwt_condition.wait x.signal >>= fun () -> go () )
+
+  let release x =
+    x.curr_count <- pred x.curr_count;
+    Lwt_condition.signal x.signal ()
+
+end
+
 module FdPool = struct
 
   let max_count = 50
-  let curr_count = ref 0
 
-  let c : unit Lwt_condition.t = Lwt_condition.create ()
+  let c = Semaphore.make max_count
 
-  let fd_use () =
-    if !curr_count < max_count
-    then ( incr curr_count; Lwt.return_unit )
-    else ( Lwt_condition.wait c >>= fun () -> incr curr_count; Lwt.return_unit )
+  let fd_use () = Semaphore.obtain c
 
-  let fd_free () =
-    decr curr_count; Lwt_condition.signal c ()
+  let fd_free () = Semaphore.release c
 
   let with_fd (f : unit -> 'a Lwt.t) : 'a Lwt.t =
     begin fd_use () >>= f end
       [%lwt.finally fd_free (); Lwt.return_unit]
+
+end
+
+module GH = struct
+
+  type _ req =
+    | Count_previous_posts : pull_request -> int req
+    | Comment : pull_request * string -> string req
+    | Status : (pull_request * Github_t.status_state * string option) -> unit req
+    | Pr : int -> Github_t.pull req
+    | Needing_check : int list req
+
+  type breq = R : 'a req * 'a Lwt.u -> breq
+
+  let count_previous_posts conf { pr_user = user; number; _ } =
+    let open Github.Monad in
+    let open Github_t in
+    let s = Github.Search.issues
+        ~qualifiers:[`Author user;
+                     `Repo (conf.Conf.repo.user ^"/"^conf.Conf.repo.name);]
+        ~keywords:[] ()
+    in
+    bind (function
+        | None -> return 0
+        | Some ({repository_issue_search_total_count = c}, _) -> return c
+      )
+      (Github.Stream.next s)
+
+  let comment conf pr body =
+    let open Github.Monad in
+    let open Github_t in
+    let token = conf.Conf.token in
+    let user = pr.base.repo.user in
+    let repo = pr.base.repo.name in
+    let num = pr.number in
+    let rec find_comment stream =
+      Github.Stream.next stream >>= function
+      | Some (c, s) ->
+        if c.issue_comment_user.user_login = conf.name then return (Some c)
+        else find_comment s
+      | None -> return None
+    in
+    begin
+      find_comment (Github.Issue.comments ~token ~user ~repo ~num ())
+      >>= function
+      | None ->
+        Github.Issue.create_comment ~token ~user ~repo ~num ~body ()
+      | Some { issue_comment_id = id; _ } ->
+        Github.Issue.update_comment ~token ~user ~repo ~id ~body ()
+    end >>~ (fun { issue_comment_html_url = url; _ } -> return url)
+
+  let status conf pr status text =
+      let open Github.Monad in
+      let open Github_t in
+      let token = conf.Conf.token in
+      let status = {
+        new_status_state = status;
+        new_status_target_url = None;
+        new_status_description = text;
+        new_status_context = Some conf.Conf.name;
+      } in
+      Github.Status.create
+        ~token ~user:pr.base.repo.user ~repo:pr.base.repo.name
+        ~status ~sha:pr.head.sha ()
+      >>~ fun _ -> return ()
+
+  let pr conf repo num =
+    let open Github.Monad in
+    let open Github_t in
+    Github.Pull.get ~user:repo.user ~repo:repo.name ~num () >|=
+    Github.Response.value
+
+  let needing_check conf repo =
+    let open Github.Monad in
+    let open Github_t in
+    let token = conf.Conf.token in
+    Github.Pull.for_repo
+      ~token ~state:`Open ~user:conf.repo.user ~repo:conf.repo.name ()
+    |> Github.Stream.map (fun pr ->
+        let stream = Github.Issue.comments
+            ~token ~user:repo.user ~repo:repo.name ~num:pr.pull_number ()
+        in
+        Github.Stream.find
+          (fun { issue_comment_user = u; _ } -> u.user_login = conf.Conf.name)
+          stream
+        >>= function
+        | Some ({ issue_comment_body = b; _ },_) ->
+          begin
+            try Scanf.sscanf b "Commit: %s\n"
+                  (fun c ->
+                     if String.equal c pr.pull_head.branch_sha
+                     then return []
+                     else return [pr.pull_number])
+            with _ -> return [pr.pull_number] end
+        | None -> return [pr.pull_number]
+      )
+    |> Github.Stream.to_list
+
+  let eval : type a. Conf.t -> repo -> a req -> a Github.Monad.t =
+    fun conf repo req ->
+      let open Github.Monad in
+      let open Github_t in
+      match req with
+      | Count_previous_posts pr -> count_previous_posts conf pr
+      | Comment (pr,body) -> comment conf pr body
+      | Status (pr,s,text) -> status conf pr s text
+      | Pr num -> pr conf repo num
+      | Needing_check -> needing_check conf repo
+
+
+  let gh_stream, gh_push = Lwt_stream.create ()
+
+  let request : type a. a req -> a Lwt.t = fun req ->
+    let (promise, resolve) = Lwt.wait () in
+    gh_push ( Some ( R ( req, resolve ) ) );
+    promise
+
+  let loop ?(ntries=3) ?(retry_interval=60.) ~conf () =
+    let step () =
+      match%lwt Lwt_stream.next gh_stream with
+      | exception exn ->
+        log "Event handler failed: %s" (Printexc.to_string exn);
+        Lwt.return (Github.Monad.return ())
+      | R ( req, resolve ) ->
+        let repo = conf.Conf.repo in
+        let rec evaln n =
+          ( let open Github.Monad in
+            catch
+              (fun () -> eval conf repo req >>= fun res ->
+                Lwt.wakeup_later resolve res; return () )
+              (fun exn ->
+                 if n > 0
+                 then ( embed (Lwt_unix.sleep retry_interval) >>= fun () -> evaln (pred n) )
+                 else ( Lwt.wakeup_later_exn resolve exn; return () ) ) )
+        in
+        Lwt.return @@ evaln ntries
+    in
+    let rec looper () =
+      let open Github.Monad in
+      step () |> embed |> bind (fun x -> x) >>= looper
+    in
+    Github.Monad.run @@ looper ()
 
 end
 
@@ -754,7 +1015,7 @@ module PrChecks = struct
             OpamStd.String.ends_with ~suffix:"/opam" s
           -> true
         | _ -> false)
-      files
+        files
     in
     List.map (function (s, Some c) -> (OpamFilename.of_string s, c) | (_,None) -> assert false) opamfiles,
     List.map fst others
@@ -1031,8 +1292,28 @@ module PrChecks = struct
     | l -> "\n\n---\n\n##### :sun_behind_small_cloud: " ^ (string_of_int @@ List.length l ) ^ " ignored non-opam files:\n\n" ^
            OpamStd.Format.itemize ~bullet:"* " (fun s -> s) l
 
-  let run pr gitstore =
-    let%lwt () = RepoGit.fetch_pr pr gitstore in
+  let msg_header ~conf pr =
+    let%lwt hello_msg =
+      begin match pr.pr_user with
+        | "AltGr" -> Lwt.return "As you wish, master!"
+        | "kit-ty-kate" -> Lwt.return "Good to see you Madam."
+        | "thomasblanc" -> Lwt.return "Tom, are you trying to break me again?"
+        | user ->
+          Lwt.catch
+            (fun () ->
+               GH.request (Count_previous_posts pr) >>= fun l ->
+                 Lwt.return @@
+                 if l <= 1
+                 then Printf.sprintf "Hello @%s! I believe this is your first contribution here. Please be nice, reviewers!" user
+                 else if l <= 50
+                 then Printf.sprintf "@%s has posted %d contributions." user l
+                 else Printf.sprintf "A pull request by opam-seasoned @%s." user
+            )
+            (fun _ -> Lwt.return "I made an error retrieving the post by the user, sorry about that")
+      end in
+    Lwt.return @@ Printf.sprintf "Commit: %s\n\n%s\n\n" pr.head.sha hello_msg
+
+  let run_nogit ~conf pr gitstore msghead =
     let head = pr.head.sha in
     let%lwt ancestor = RepoGit.common_ancestor pr gitstore in
     let%lwt opam_files, other_files = changed_opam_files ancestor head gitstore in
@@ -1050,62 +1331,58 @@ module PrChecks = struct
         installability_check ancestor head gitstore packages
       in
       Lwt.return (add_status stlint stinst,
-                  msglint ^ "\n\n---\n" ^ msginst ^ misc_files_body)
+                  msghead ^ msglint ^ "\n\n---\n" ^ msginst ^ misc_files_body)
     with e ->
       log "Installability check failed: %s%s" (Printexc.to_string e)
         (Printexc.get_backtrace ());
-      Lwt.return (stlint, msglint ^ misc_files_body)
+      Lwt.return (stlint, msghead ^ msglint ^ misc_files_body)
 
+  let run ~conf pr gitstore =
+    let%lwt () = RepoGit.fetch_pr pr gitstore in
+    let%lwt msghead = msg_header ~conf pr in
+    run_nogit ~conf pr gitstore msghead
 end
 
 module Github_comment = struct
 
-  open Github.Monad
   open Github_t
 
   let github_max_descr_length = 140
 
-  let github_mutex = Lwt_mutex.create ()
-  let run cmd =
-    Lwt.bind (Lwt_mutex.lock github_mutex)
-      (fun () ->
-         Lwt.finalize (fun () -> run cmd)
-           (fun () -> Lwt_mutex.unlock github_mutex; Lwt.return_unit)
-      )
-
-  let make_status ~name ~token pr ?text status =
-    let status = {
-      new_status_state = status;
-      new_status_target_url = None;
-      new_status_description = text;
-      new_status_context = Some name;
-    } in
-    Github.Status.create
-      ~token ~user:pr.base.repo.user ~repo:pr.base.repo.name
-      ~status ~sha:pr.head.sha ()
+  (* let make_status ~name ~token pr ?text status =
+   *   let status = {
+   *     new_status_state = status;
+   *     new_status_target_url = None;
+   *     new_status_description = text;
+   *     new_status_context = Some name;
+   *   } in
+   *   Github.Status.create
+   *     ~token ~user:pr.base.repo.user ~repo:pr.base.repo.name
+   *     ~status ~sha:pr.head.sha () *)
 
   let push_status ~name ~token pr ?text status =
-    run (make_status ~name ~token pr ?text status)
+    GH.request (Status ( pr, status, text))
+
+  let make_status = function
+    | `Passed ->
+      `Success, "All tests passed"
+    | `Warnings ps ->
+      `Success,
+      let m = "Warnings for "^String.concat ", " ps in
+      if String.length m <= github_max_descr_length then m else
+        Printf.sprintf "Warnings for %d packages" (List.length ps)
+    | `Errors ps ->
+      `Error,
+      let m = "Errors for "^String.concat ", " ps in
+      if String.length m <= github_max_descr_length then m else
+        Printf.sprintf "Errors for %d packages" (List.length ps)
+
 
   let push_report ~name ~token ~report:(status,body) pr =
-    let user = pr.base.repo.user in
-    let repo = pr.base.repo.name in
-    let num = pr.number in
     let comment () =
       log "Commenting...";
-      let rec find_comment stream =
-        Github.Stream.next stream >>= function
-        | Some (c, s) ->
-          if c.issue_comment_user.user_login = name then return (Some c)
-          else find_comment s
-        | None -> return None
-      in
-      find_comment (Github.Issue.comments ~token ~user ~repo ~num ())
-      >>= function
-      | None ->
-        Github.Issue.create_comment ~token ~user ~repo ~num ~body ()
-      | Some { issue_comment_id = id; _ } ->
-        Github.Issue.update_comment ~token ~user ~repo ~id ~body ()
+      GH.request @@ Comment (pr,body) >>= fun cmturl ->
+      Lwt.return @@ log "Comment posted on %s" cmturl
     in
     let push_status () =
       log "Pushing status...";
@@ -1123,135 +1400,51 @@ module Github_comment = struct
           if String.length m <= github_max_descr_length then m else
             Printf.sprintf "Errors for %d packages" (List.length ps)
       in
-      make_status ~name ~token pr ~text state
+      push_status ~name ~token pr ~text state
     in
-    run (
-      comment () >>= fun _ ->
-      push_status () >>= fun _ ->
-      return (log "Comment posted back to PR #%d" pr.number);
-    )
+    comment () >>= fun () ->
+    push_status () >>= fun () ->
+    Lwt.return (log "Comment posted back to PR #%d" pr.number)
 
-  let pull_request ~name ~token repo branch target_branch ?message title =
-    log "Pull-requesting...";
-    let pr () =
-      let rec find_pr stream =
-        Github.Stream.next stream >>= function
-        | Some (pr, s) ->
-          if pr.pull_head.branch_ref = branch &&
-             pr.pull_base.branch_ref = target_branch
-          then return (Some pr)
-          else find_pr s
-        | None -> return None
-      in
-      find_pr (Github.Pull.for_repo
-                 ~token ~state:`Open ~user:repo.user ~repo:repo.name ())
-      >>= function
-      | None ->
-        let pull = {
-          new_pull_title = title;
-          new_pull_body = message;
-          new_pull_base = target_branch;
-          new_pull_head = branch;
-        } in
-        Github.Pull.create ~token ~user:repo.user ~repo:repo.name ~pull ()
-      | Some pr ->
-        let update_pull = {
-          update_pull_title = Some title;
-          update_pull_body = message;
-          update_pull_state = None;
-          update_pull_base = None;
-        } in
-        Github.Pull.update ~token ~user:repo.user ~repo:repo.name
-          ~num:pr.pull_number ~update_pull ()
-    in
-    run (
-      pr () >>= fun resp ->
-      return (log "Filed pull-request #%d" resp#value.pull_number)
-    )
+  (* let pull_request ~name ~token repo branch target_branch ?message title =
+   *   let open Github.Monad in
+   *   log "Pull-requesting...";
+   *   let pr () =
+   *     let rec find_pr stream =
+   *       Github.Stream.next stream >>= function
+   *       | Some (pr, s) ->
+   *         if pr.pull_head.branch_ref = branch &&
+   *            pr.pull_base.branch_ref = target_branch
+   *         then return (Some pr)
+   *         else find_pr s
+   *       | None -> return None
+   *     in
+   *     find_pr (Github.Pull.for_repo
+   *                ~token ~state:`Open ~user:repo.user ~repo:repo.name ())
+   *     >>= function
+   *     | None ->
+   *       let pull = {
+   *         new_pull_title = title;
+   *         new_pull_body = message;
+   *         new_pull_base = target_branch;
+   *         new_pull_head = branch;
+   *       } in
+   *       Github.Pull.create ~token ~user:repo.user ~repo:repo.name ~pull ()
+   *     | Some pr ->
+   *       let update_pull = {
+   *         update_pull_title = Some title;
+   *         update_pull_body = message;
+   *         update_pull_state = None;
+   *         update_pull_base = None;
+   *       } in
+   *       Github.Pull.update ~token ~user:repo.user ~repo:repo.name
+   *         ~num:pr.pull_number ~update_pull ()
+   *   in
+   *   GH.run (fun () ->
+   *       pr () >>= fun resp ->
+   *       return (log "Filed pull-request #%d" resp#value.pull_number)
+   *     ) *)
 
-end
-
-module Conf = struct
-  module C = struct
-    let internal = ".opam-ci"
-
-    type t = {
-      port: int;
-      name: string;
-      token: Github.Token.t;
-      secret: Cstruct.t;
-      repo: repo;
-      roles: [ `Pr_checker | `Push_upgrader ] list;
-      base_branch: string;
-      dest_branch: string;
-    }
-
-    let empty = {
-      port = 8122;
-      name = "opam-ci";
-      token = Github.Token.of_string "";
-      secret = Cstruct.of_string "";
-      repo = { user="ocaml"; name="opam-repository"; auth=None };
-      roles = [ `Pr_checker ];
-      base_branch = "master";
-      dest_branch = "2.0.0";
-    }
-
-    open OpamPp.Op
-
-    let role_of_string = function
-      | "pr_checker" -> `Pr_checker
-      | "push_upgrader" -> `Push_upgrader
-      | _ -> failwith "Invalid role (accepted are pr_checker, push_upgrader)"
-
-    let role_to_string = function
-      | `Pr_checker -> "pr_checker"
-      | `Push_upgrader -> "push_upgrader"
-
-    let fields = [
-      "port", OpamPp.ppacc (fun port t -> {t with port}) (fun t -> t.port)
-        OpamFormat.V.pos_int;
-      "name", OpamPp.ppacc (fun name t -> {t with name}) (fun t -> t.name)
-        OpamFormat.V.string;
-      "token", OpamPp.ppacc (fun token t -> {t with token}) (fun t -> t.token)
-        (OpamFormat.V.string -|
-         OpamPp.of_module "token" (module Github.Token));
-      "secret", OpamPp.ppacc
-        (fun secret t -> {t with secret}) (fun t -> t.secret)
-        (OpamFormat.V.string -|
-         OpamPp.of_pair "secret"
-           Cstruct.((of_string ?allocator:None ?off:None ?len:None), to_string));
-      "repo-user", OpamPp.ppacc
-        (fun user t -> {t with repo = {t.repo with user}})
-        (fun t -> t.repo.user)
-        OpamFormat.V.string;
-      "repo-name", OpamPp.ppacc
-        (fun name t -> {t with repo = {t.repo with name}})
-        (fun t -> t.repo.name)
-        OpamFormat.V.string;
-      "roles", OpamPp.ppacc
-        (fun roles t -> {t with roles })
-        (fun t -> t.roles)
-        (OpamFormat.V.map_list ~depth:1 @@
-         OpamFormat.V.ident -|
-         OpamPp.of_pair "role" (role_of_string, role_to_string));
-      "base-branch", OpamPp.ppacc
-        (fun base_branch t -> {t with base_branch })
-        (fun t -> t.base_branch)
-        OpamFormat.V.string;
-      "dest-branch", OpamPp.ppacc
-        (fun dest_branch t -> {t with dest_branch })
-        (fun t -> t.dest_branch)
-        OpamFormat.V.string;
-    ]
-
-    let pp =
-      OpamFormat.I.map_file @@
-      OpamFormat.I.fields ~name:internal ~empty fields -|
-      OpamFormat.I.show_errors ~name:internal ~strict:true ()
-  end
-  include C
-  include OpamFile.SyntaxFile(C)
 end
 
 module Webhook_handler = struct
@@ -1402,4 +1595,103 @@ module Webhook_handler = struct
       ~on_exn:(fun e -> log "Server exn: %s" (Printexc.to_string e))
       ~mode:(`TCP (`Port port))
       (Server.make ~callback ())
+end
+
+module Fork_handler = struct
+
+  let forktable : (int,unit Lwt.t * Lwt_process.process_out) Hashtbl.t =
+    Hashtbl.create 111
+
+  let fork_sema = Semaphore.make 20
+
+  let linearize_repo { user; name; auth; } =
+    match auth with
+    | None -> [| user; name; ""; "" |]
+    | Some (a,b) -> [| user; name; a; b |]
+  let delinearize_repo a offset =
+    { user = a.(offset); name = a.(offset+1);
+      auth =
+        match a.(offset+2), a.(offset+3) with
+        | "","" ->  None
+        | a,b -> Some (a,b) }
+
+  let l_repo = 4
+
+  let linearize_full_ref { repo; ref; sha } =
+    Array.append (linearize_repo repo) [| ref; sha; |]
+  let delinearize_full_ref a offset =
+    { repo = delinearize_repo a offset;
+      ref = a.(offset+l_repo);
+      sha = a.(offset+l_repo+1);
+    }
+  let l_fr = l_repo + 2
+
+  let linearize_pr { number; base; head; pr_user; message = a,b; } =
+    Array.concat [
+      [| string_of_int number |];
+      (linearize_full_ref base);
+      (linearize_full_ref head);
+      [|pr_user;a;b|]
+    ]
+  let delinearize_pr a offset =
+    {
+      number = int_of_string a.(offset);
+      base = delinearize_full_ref a (succ offset);
+      head = delinearize_full_ref a (succ offset + l_fr);
+      pr_user = a.(succ offset + l_fr + l_fr);
+      message = (a.(offset + l_fr + l_fr + 2), a.(offset + l_fr + l_fr + 3));
+    }
+
+  let gen_args conf pr =
+    let%lwt msghead = PrChecks.msg_header ~conf pr in
+    Lwt.return @@
+    (conf.Conf.camelus_child_loc,
+     Array.concat [ [|conf.Conf.camelus_child_loc|];
+                   linearize_pr pr;
+                   [|msghead|]; ] )
+
+  let process ~conf pr =
+    let commit = pr.head.sha in
+    let num = pr.number in
+    begin
+      match Hashtbl.find_opt forktable num with
+      | None -> Lwt.return_unit
+      | Some (old_promise, old_process) ->
+        old_process#terminate;
+        Lwt.catch (fun () -> old_promise) (fun _ -> Lwt.return_unit)
+    end >>= fun () ->
+    let%lwt args = gen_args conf pr in
+    let%lwt () = Semaphore.obtain fork_sema in
+    let process =
+      Lwt_process.open_process_out
+        ~stdout:`Keep ~stderr:`Keep
+        args
+    in
+    let waiter,wakener = Lwt.wait () in
+    let promise =
+      Lwt.finalize
+        (fun () -> waiter >>=
+          fun () -> process#status >>=
+          fun stat -> (
+            match stat with
+            | Unix.WEXITED e ->
+              log "pr %d commit %s handled, exit status %d" num commit e
+            | Unix.WSIGNALED s ->
+              log "pr %d commit %s killed, signal %d" num commit s
+            | Unix.WSTOPPED s ->
+              log "pr %d commit %s stopped, signal %d" num commit s
+          );
+          Lwt.return_unit)
+        (fun () ->
+           Hashtbl.remove forktable num;
+           Semaphore.release fork_sema;
+           Lwt.return_unit)
+    in
+    Hashtbl.replace forktable num (promise,process);
+    Lwt.wakeup_later wakener ();
+    Lwt.return_unit
+
+  let pending_processes () =
+    Hashtbl.fold (fun _ (p,_) l -> p::l) forktable []
+
 end

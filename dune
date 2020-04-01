@@ -33,3 +33,12 @@
  (libraries camelus)
  (preprocess (pps lwt_ppx))
 )
+
+(executable
+ (name camelus_child)
+ (public_name camelus_child)
+ (package camelus)
+ (modules camelus_child)
+ (libraries camelus)
+ (preprocess (pps lwt_ppx))
+)
